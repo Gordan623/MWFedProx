@@ -1,0 +1,46 @@
+## Runner settings
+CREATE_SUBDIR_PER_RUN: True  # create a subdirectory for each run
+server_file: './server.py'  # server file
+client_file: './client.py'  # client file
+
+## File settings
+config: './config.yaml'  # use config file, will overwrite any other arguments
+data_dir: '../datasets/cifar10_nc30_distiid_blc1/'  # dataset directory
+work_dir: './runs/cifar10/'  # working directory
+run_dir: './runs/cifar10/test_1'
+
+## Training settings
+seed: 2024  # random seed
+batch_size: 16  # batch size
+test_batch_size: 64  # test batch size
+lr: 0.01  # learning rate
+weight_decay: 0.0001  # weight decay
+max_epochs: 500  # epoch
+dropout: 0.5  # dropout rate
+momentum: 0.9
+
+## Federated learning settings
+num_clients: 30  # number of clients
+num_training_clients: 30  # number of training clients (original 15)
+
+# custom settings
+method: fedprox  # For distiguish federated learning method
+# mnist:cnn, mlr, dnn; cifar10: mlr, cnn, dnn
+model_type: alexnet  # model type
+dataset_type: cifar10  # dataset_type
+
+# Logging settings
+log_path:      # log directory, set blank to use default
+verb: 1  # verbose, True or False
+
+# FedProx
+mu: 1
+stragglers: 0.9 # 0.0-1.0
+local_epochs: 5  # max local epochs to choose from
+
+# multi-width
+widths: [0.25, 0.5, 0.75, 1.0] # supported model widths
+width_assignment_strategy: random # width_assignment_strategy: strategy for assigning widths to clients
+
+USE_SIM_SYSHET: False
+USE_TENSORBOARD: False
