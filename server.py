@@ -136,6 +136,18 @@ class ProxServer(Server):
         else:
             raise ValueError(f"Unknown width assignment strategy: {self.width_assignment_strategy}")
 
+    def extract_width_params(self, params, width):
+        """
+        根据宽度提取差异部分
+        Args:
+            width: 当前模型宽度
+        Return:
+            sub_model: 裁剪的子模型params字典
+        """
+        sub_model = create_model_instance(self.model_type, self.dataset_type, width)
+        sub_model.load_state_dict(params, strict=False)
+        return sub_model.state_dict()
+
     def multi_width_broadcast(self):
         """
         按客户端宽度生成兼容参数并广播
@@ -143,7 +155,7 @@ class ProxServer(Server):
         dest_ranks = {None}
         for client in self.selected_clients:
             # 动态生成与客户端宽度兼容的参数字典
-            compatible_params = self.generate_compatible_params(client.width)
+            compatible_params = self.extract_width_params(self.model.state_dict(), client.width)
             self.network.send(
                 data = {
                     'status': 'TRAINING',
@@ -160,179 +172,55 @@ class ProxServer(Server):
         if self.verb:
             self.log(f'Server broadcast to {dest_ranks} succeed')
 
-    def generate_compatible_params(self, width):
-        """
-        生成与指定宽度兼容的参数字典
-        Args:
-            width: 客户端的宽度client.width
-        """
-        global_width = 1.0  # 全局模型的宽度默认为1.0
-        width_ratio = width / global_width
-        
-        # 获取全局模型的完整参数
-        global_state = self.model.state_dict()
-        
-        # 创建目标宽度模型
-        model_subset = create_model_instance(self.model_type, self.dataset_type, width)
-        subset_state = model_subset.state_dict()
-        
-        # 按宽度比例裁剪参数
-        for name, param in global_state.items():
-            if name not in subset_state:
-                continue  # 跳过不存在的层
-            
-            ## TODO:
-            # for target_param, global_param in zip(slim_model.parameters(), fat_model.parameters()):
-            #     target_param = global_param[:len(target_param)]
-                
-            
-            # 按层类型裁剪
-            if 'conv' in name and 'weight' in name:
-                # 卷积核权重 [out_channels, in_channels, kH, kW]
-                out_channels = int(param.shape[0] * width_ratio)
-                in_channels = int(param.shape[1] * width_ratio)
-                subset_state[name] = param[:out_channels, :in_channels, ...]
-                
-            elif 'conv' in name and 'bias' in name:
-                out_channels = int(param.shape[0] * width_ratio)
-                subset_state[name] = param[:out_channels]
-                
-            elif 'bn' in name:
-                # BN层参数（weight/bias/running_mean/running_var）
-                channels = int(param.shape[0] * width_ratio)
-                subset_state[name] = param[:channels]
-                
-            else:
-                # 全连接层等不兼容层直接跳过
-                continue
-        
-        return subset_state
-
-    def average_group_params(self, clients, weight_by_samples=True):
-        """
-        对同一宽度组内的客户端参数按样本量加权平均
-        Args:
-            clients: 客户端列表(需包含 `params` 和 `train_samples` 属性)
-            # weight_by_samples: 是否按样本量加权(否则按客户端数量平均)
-        Returns:
-            avg_params: 平均后的参数字典(state_dict)
-        """
-        if not clients:
-            return {}
-        
-        # 初始化累加器&权重和
-        avg_params = {}
-        total_weight = 0.0
-
-        # 处理client的参数
-        for client in clients:
-            weight = client.train_samples if weight_by_samples else 1.0
-            total_weight += weight
-
-            for name, param in client.params.items():
-                # param = param.to('cpu')  # 为了节省显存, 如果报错可以省略
-                if name not in avg_params:
-                    avg_params[name] = torch.zeros_like(param)*weight
-                else:
-                    avg_params[name] += param*weight
-        
-        # 计算加权平均
-        for name in avg_params:
-            avg_params[name] /= total_weight
-
-        return avg_params
-
-    def crop_params(self, source_params, source_width, target_width, model_type):
-        """
-        将源宽度参数裁剪为目标宽度兼容格式
-        Args:
-            source_params: 源参数字典(state_dict)
-            source_width: 源模型宽度(如0.5)
-            target_width: 目标模型宽度(如1.0)
-            model_type: 模型类型(用于确定裁剪规则, 暂未用到)
-        Returns:
-            cropped_params: 裁剪后的参数字典(state_dict)'
-        """
-        def _get_dim(original_dim, width_ratio):
-            # 计算裁剪维度
-            return int(original_dim*width_ratio+0.5)  # 四舍五入
-
-        cropped_params = {}
-        width_ratio = target_width / source_width  # 计算扩展比例, 例如: 目标1.0 / 源0.5 = 2.0(需要扩展2倍)
-        
-        # 处理过程
-        for name, param in source_params.items():
-            # 全连接层无需处理
-            if 'classifier' in name or 'fc' in name:
-                continue
-            
-            # 按层类型填充&裁剪
-            # 处理卷积层权重
-            if 'conv' in name and 'weight' in name:
-                # PyTorch固定的卷积核权重格式: [out_channels, in_channels, kH, kW]
-                # kH == kernel_height, kW == kernel_width
-                original_out = param.size(0)
-                original_in = param.size(1)
-                new_out = _get_dim(original_out, width_ratio)
-                new_in = _get_dim(original_in, width_ratio)
-
-                # 填充&裁剪(一般target_width>source_width, 需要填充)
-                if width_ratio >= 1.0:  # 填充
-                    # 创建一个填充了零的新张量, 并将原始参数复制到其中
-                    padded_param = torch.zeros((new_out, new_in, *param.shape[2:]), dtype = param.dtype)
-                    padded_param[:original_out, :original_in, ...] = param
-                    cropped_params[name] = padded_param
-                else:  #裁剪
-                    cropped_params = param[:new_out, :new_in, ...]
-            # 处理卷积层偏置
-            elif 'conv' in name and 'bias' in name:
-                # PyTorch固定的卷积偏置格式: [out_channels]
-                new_dim = _get_dim(param.size(0), width_ratio)
-                # 如果目标宽度小于或等于源宽度-->直接裁剪偏置参数
-                # 如果目标宽度大于源宽度-->将原始偏置参数与零张量拼接
-                cropped_params[name] = param[:new_dim] if width_ratio <= 1.0 else torch.cat([param, torch.zeros(new_dim - param.size(0))])
-            # 处理bn层
-            elif 'bn' in name:
-                # 按通道数裁剪
-                new_dim = _get_dim(param.size(0), width_ratio)
-                cropped_params[name] = param[:new_dim]
-
-        return cropped_params
-
     def multi_width_aggregate(self, clients=None):
         """
-        修改内容: 按区域逐层聚合
+        按区域逐层聚合: 每个宽度区间视为一个层级, 例如0.0-0.25为一个层级, 0.25-0.5为一个层级, 以此类推
         Args:
             clients: 需要处理的客户端集(list)
         Returns:
             None(用load_state_dict()方法为模型载入参数)
         """
         # 初始化全局模型
-        global_state = self.model.state_dict()
-        aggregated_params = copy.deepcopy(global_state)
+        sorted_widths = sorted(self.args.widths)
+        global_model = create_model_instance(self.model_type, self.dataset_type, 1.0)
+        global_state = global_model.state_dict()
 
-        # 1. 按宽度分组, 遍历每一个宽度
-        for width in self.widths:
-            # eligible_clients的定义代表共有此width的客户端
-            # len(eligible_clients)代表共有此width的客户端数量
-            eligible_clients = [client for client in clients if client.width >= width]
-            if not eligible_clients:
+        # 初始化各个宽度层级对应的累加器
+        layer_aggregates = {weight: {key: torch.zeros_like(value) for key, value in global_state.items()} for weight in sorted_widths}
+        # layer_weights = {weight: 0.0 for weight in sorted_widths}
+
+        # 按层级从低层到高层逐步聚合: [0.0, 0.25] --> [0.75, 1.0]
+        # width_level: 每个层级最右端区间作为当前层级代表, 便于代码书写
+        for idx, width_level in enumerate(sorted_widths):
+            # 筛选共有当前层级的客户端eligible_clients
+            eligible_clients = [client for client in clients if client.width>=width_level]
+            total_weight = sum(client.train_samples for client in eligible_clients)
+            if total_weight == 0:
                 continue
-            # 计算当前宽度组的增量参数
-            group_avg_params = self.average_group_params(eligible_clients)
-            # 裁剪当前宽度的参数
-            cropped_params = self.crop_params(group_avg_params, width-0.25, width)
+            # 提取所有客户端当前层级的参数然后累加: 比如当前层级为0.5, 那么就提取模型[0.25, 0.5]之间的params
+            for client in eligible_clients:
+                # 第一个宽度层级直接提取该宽度下的参数
+                if idx == 0:
+                    delta_params = self.extract_width_params(client.params, width_level)
+                # 后面的宽度层级需计算当前宽度与前一宽度的参数差异
+                else:
+                    prev_params = self.extract_width_params(client.params, sorted_widths[idx-1])
+                    current_params = self.extract_width_params(client.params, width_level)
+                    delta_params = {key: current_params[key]-prev_params.get(key, 0) for key in current_params}  # 差异计算               
+                # 当前层级参数提取出来之后进行加权累加
+                weight = client.train_samples/total_weight
+                for name in delta_params:
+                    if name in layer_aggregates[width_level]:
+                        layer_aggregates[width_level][name] += delta_params[name]*weight
+            
+            # 全局模型更新
+            current_layer_state = global_model.state_dict()
+            for name in current_layer_state:
+                if name in layer_aggregates[width_level]:
+                    current_layer_state[name] += layer_aggregates[width_level][name]
+            global_model.load_state_dict(current_layer_state)
 
-            # 2. 按宽度逐层合并
-            for name, param in cropped_params.items():
-                if name in aggregated_params:
-                    if param.shape == aggregated_params[name].shape:
-                        weight = len(eligible_clients)/len(clients)
-                        aggregated_params[name] = param*weight
-                    else: 
-                        self.log(f"参数 {name} 形状不匹配: 全局 {aggregated_params[name].shape} 而当前 {param.shape}")
-        
-        self.model.load_state_dict(aggregated_params, strict = False)
+        self.model.load_state_dict(global_model.state_dict())
 
     def run(self):
         """
