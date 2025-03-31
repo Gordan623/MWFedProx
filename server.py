@@ -24,13 +24,11 @@ class ProxClientInfo(ClientInfo):
         self.is_straggler = False
         self.local_epochs = 10
         self.width = 1.0  # 添加宽度属性
+        self.last_params = None  # 用于存储上次的参数
 
 class ProxServer(Server):
     def init(self):
         # TODO: 你想写的东西放在这里
-        # self.model =
-        # self.dataset =
-        
         self.widths = self.args.widths  # 支持的模型宽度
         self.width_assignment_strategy = self.args.width_assignment_strategy
         self.model_widths = {}  # 用于存储不同宽度的模型
@@ -120,21 +118,105 @@ class ProxServer(Server):
         based on strategy.
         """
         if self.width_assignment_strategy == 'random':
-            for rank in self.selected_clients_idxes:
-                client = self.get_client_by_rank(rank)
-                client.width = random.choice(self.widths)
+            for client in self.all_clients:
+                client.width = random.choice(self.args.widths)
+                self.log(f"1st round, client {client.rank} assigned width: {client.width}")
         elif self.width_assignment_strategy == 'ordered':
-            # Here to complete your own strategy
             for rank in self.selected_clients_idxes:
                 client = self.get_client_by_rank(rank)
                 client.width = self.widths[rank%len(self.widths)]
-            # pass
+                self.log(f"1st round, client {client.rank} assigned width: {client.width}")
         elif self.width_assignment_strategy == 'fixed':
             for rank in self.selected_clients_idxes:
                 client = self.get_client_by_rank(rank)
                 client.width = self.widths[0]
+                self.log(f"1st round, client {client.rank} assigned width: {client.width}")
+        elif self.width_assignment_strategy == 'cluster':
+            clusters = self.cluster_clients(self.all_clients)
+            # 按簇分配
+            for cluster_id, cluster_clients in clusters.items():
+                # 每个簇对应一个宽度
+                width = self.widths[cluster_id % len(self.widths)]
+                for client in cluster_clients:
+                    client.width = width
+                    self.log(f"1st round, client {client.rank} assigned width: {client.width}")
         else:
             raise ValueError(f"Unknown width assignment strategy: {self.width_assignment_strategy}")
+
+    def cosine_similarity(self, params1, params2):  # torch.nn.functional.cosine_similarity只能用来计算展平向量
+        # 计算两个模型参数的余弦相似度(跳过BN层)
+        dot_product = 0
+        norm1, norm2 = 0, 0
+        for name in params1:
+            if 'bn' not in name and name in params2:
+                p1, p2 = params1[name], params2[name]
+                dot_product += torch.dot(p1.flatten(), p2.flatten())
+                norm1 += torch.norm(p1) ** 2
+                norm2 += torch.norm(p2) ** 2
+        return dot_product / (torch.sqrt(norm1) * torch.sqrt(norm2) + 1e-8)
+
+    def cluster_clients(self, clients):
+        """
+        聚簇逻辑
+        Args:
+            clients: 即将被分配的客户端集
+        Return:
+            clusters: 聚类完的簇
+        """
+        # 初始化: 从所有设备中随机选取 |S| 个设备(这里设为M), 并将这些设备的本地模型参数作为初始簇中心
+        M = len(self.args.widths)  # 簇的数量
+        active_clients = [client for client in clients if client.last_params is not None]
+        if len(active_clients) < M:
+            return defaultdict(list)  # 如果活跃客户端不足, 返回空簇
+
+        # 随机选取 M 个客户端的参数作为初始簇中心
+        centroids = [copy.deepcopy(active_clients[i].last_params) for i in range(M)]
+
+        # 迭代更新簇
+        max_iterations = 5  # 最大迭代次数
+        for _ in range(max_iterations):
+            clusters = defaultdict(list)
+            # 簇分配: 计算每个设备与所有簇中心的余弦相似度, 将设备分配到相似度最高的簇
+            for client in active_clients:
+                max_sim, best_cluster = -1, 0
+                for i, centroid in enumerate(centroids):
+                    sim = self.cosine_similarity(client.last_params, centroid)
+                    if sim > max_sim:
+                        max_sim, best_cluster = sim, i
+                clusters[best_cluster].append(client)
+
+            # # TODO: 检查每个簇是否满足最小设备数量要求: 如果某个簇中设备数量还未达到预设的上限
+            # # (例如，每个簇至少需要超过 M 个设备), 则优先将设备分配到该簇
+
+            # 更新簇中心: 对于每个簇, 根据簇内所有设备上传的本地模型参数进行聚合(类似模型聚合), 更新簇中心
+            new_centroids = []
+            for cluster_id, cluster_clients in clusters.items():
+                if cluster_clients:
+                    avg_params = self.average_parameters([client.last_params for client in cluster_clients])
+                    new_centroids.append(avg_params)
+                else:
+                    # 如果某个簇为空, 保持原中心
+                    new_centroids.append(centroids[cluster_id])
+
+            # 检查收敛条件
+            if all(self.cosine_similarity(new_centroids[i], centroids[i]) > 0.999 for i in range(M)):
+                break
+            centroids = new_centroids
+
+        return clusters
+
+    def average_parameters(self, params_list):
+        """
+        对多个模型参数进行加权平均
+        Args:
+            params_list: 模型参数列表
+        Return:
+            avg_params: 平均后的模型参数
+        """
+        avg_params = copy.deepcopy(params_list[0])
+        for key in avg_params:
+            avg_params[key] = torch.mean(torch.stack([params[key] for params in params_list]), dim=0)
+        return avg_params
 
     def extract_width_params(self, params, width):
         """
@@ -152,7 +234,7 @@ class ProxServer(Server):
         """
         按客户端宽度生成兼容参数并广播
         """
-        dest_ranks = {None}
+        # dest_ranks = {''}
         for client in self.selected_clients:
             # 动态生成与客户端宽度兼容的参数字典
             compatible_params = self.extract_width_params(self.model.state_dict(), client.width)
@@ -163,13 +245,15 @@ class ProxServer(Server):
                     'width': client.width,
                     'local_epochs': self.local_epochs,
                     'straggler': client.is_straggler,
-                    'global_round': self.global_round
+                    'global_round': self.global_round,
+                    'local_iteration': self.local_iteration
                 },
                 dest_rank = client.rank
             )
             print(f"Server broadcast to client {client.rank} succeed")
-            dest_ranks.add(client.rank)
+            # dest_ranks.add(client.rank)
         if self.verb:
+            dest_ranks = self.selected_clients_idxes
             self.log(f'Server broadcast to {dest_ranks} succeed')
 
     def multi_width_aggregate(self, clients=None):
@@ -222,75 +306,45 @@ class ProxServer(Server):
 
         self.model.load_state_dict(global_model.state_dict())
 
+        for client in self.selected_clients:
+            client.last_params = copy.deepcopy(client.params)  # 保存当前参数供下一轮聚类使用
+
     def run(self):
         """
         Basically init client, 
         select, broadcast, listen, aggregate 
         and wait for next round
         """
-        # print(self.size,flush=True)
         self.init_clients(clientObj=ProxClientInfo)
         self.generate_global_test_set()
-        # print(os.environ)
-        # TODO: assign width
-        for client in self.all_clients:
-            client.width = random.choice(self.args.widths)
-            # self.send(client)
-            self.log(f"Client {client.rank} assigned width: {client.width}")
+        # # TODO: assign width
+        # self.assign_widths()
         while True:
+            # 第一轮随机分配宽度
+            print(f"Now, global round {self.global_round}")
+            if self.global_round == 0:
+                for client in self.all_clients:
+                    client.width = random.choice(self.args.widths)
+                    self.log(f"0th round, client {client.rank} assigned width: {client.width}")
+            elif self.global_round == 1:
+                # 第一轮按策略分配宽度, 之后不变
+                self.assign_widths()
+            print(f"Now, width assignment strategy: {self.width_assignment_strategy}")
             self.select_clients()
             self.get_and_set_stragglers()
-            # self.assign_widths()
-            msg_dict = {}
-
-            """
-            # ---------------straggler & non_straggler---------------
-            # Non stragglers
-            # 广播不同宽度的模型参数
-            for rank in self.non_stragglers_idxes: # <--不可以这么写
-            # 注意non_straggler这里的处理逻辑：dest_ranks是列表不是元素
-                # print(f"About to send to non_straggler client {rank}", flush=True)
-                client = self.get_client_by_rank(rank)
-                msg_dict[rank] = {
-                    'status': 'TRAINING',
-                    'params': self.export_model_parameter(),
-                    'local_epochs': self.local_epochs,
-                    'straggler': False,
-                    'global_round': self.global_round,
-                    'width': client.width
-                }
-                # print(f"Finished sending to non_straggler client {rank}", flush=True)
-            self.multi_width_broadcast(msg_dict)
-
-            # stragglers
-            for rank in self.stragglers_idxes:
-                # print(f"About to send to straggler client {rank}", flush=True)
-                client = self.get_client_by_rank(rank)
-                self.network.send(
-                    data={
-                        'status': 'TRAINING',
-                        'params': self.export_model_parameter(),
-                        'local_epochs': client.local_epochs,
-                        'straggler': True,
-                        'global_round': self.global_round,
-                        'width': client.width
-                    },
-                    dest_rank=rank
-                )
-                # print(f"Finished sending to straggler client {rank}", flush=True)
-            # -------------------------end-------------------------
-            """
-
             self.multi_width_broadcast()
-
-            print("Before calling listen()")
+            print("Start calling listen() ...")
             self.listen()
-            print("After calling listen()")
+            print("End calling listen().")
+            print("Start aggregating ...")
             self.multi_width_aggregate(clients = self.selected_clients)
+            print("End aggregating.")
             self.test(self.model, self.test_loader)
             self.average_client_info(self.selected_clients_idxes)
             self.finalize_round()
+            print(f"global_round {self.global_round-1} ends")
             if self.global_round >= self.max_epochs:
+                print("???")
                 break
         # out of loop
         self.log("Yes, just end your job")

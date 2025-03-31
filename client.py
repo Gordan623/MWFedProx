@@ -21,6 +21,7 @@ sys.path.append('../FLamingo/')
 
 # Now import FLamingo
 from FLamingo.core.client import *
+from FLamingo.core.utils.train_test_utils import infinite_dataloader
 from model_utils import create_model_instance
 import torch.nn.functional as F
 import copy
@@ -91,6 +92,7 @@ class FedProxClient(Client):
         self.lr_scheduler = None
         self.params = None
         self.train_samples = None
+        self.local_iteration = None
         
 
     def train(self):
@@ -102,29 +104,33 @@ class FedProxClient(Client):
         model.train()
         epoch_loss, num_samples = 0.0, 0
         train_start_time = time.time()  # 记录训练开始时间
-        for epoch in range(self.local_epochs):
-            for data, target in train_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                self.optimizer.zero_grad()
-                output = model(data)
-                # loss = self.loss_func(output, target, model.parameters(),global_model.parameters())
-                loss = self.loss_func(output, target, model, global_model)  # 传递模型实例——forward函数改变
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item() * data.size(0)
-                num_samples += data.size(0)
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+        inf_loader = infinite_dataloader(train_loader)
+        # 按迭代次数训练
+        for iter in range(self.local_iteration):
+            data, target = next(inf_loader)
+            data, target = data.to(self.device), target.to(self.device)
+
+            self.optimizer.zero_grad()  
+            output = model(data)
+
+            loss = self.loss_func(output, target, model, global_model)
+
+            loss.backward()  
+            self.optimizer.step()
+
+            epoch_loss += loss.item() * data.size(0)
+            num_samples += data.size(0)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()  # 更新学习率
         train_end_time = time.time()  # 记录训练结束时间
         train_time = train_end_time - train_start_time  # 计算训练时间
-        # -----2025.03.20修改-----
         self.train_samples = num_samples
-        # -----------------------
         return {
-            'train_loss': epoch_loss / num_samples, 
+            'train_loss': epoch_loss / num_samples,
             'train_samples': num_samples,
             'train_time': train_time
-            }
+        }
+
     
     def set_parameter(self, params_dict, model = None):
         """
@@ -153,6 +159,7 @@ class FedProxClient(Client):
                     # print(f"after init, for rank {rank}, self.width = {self.width}, data['width'] = {data['width']}")
                     
                     # ↑宽度已正确传输↑
+                    self.local_iteration = data['local_iteration']
                     
                     # TODO: change model width
                     del self.model, self.optimizer, self.lr_scheduler
@@ -165,18 +172,15 @@ class FedProxClient(Client):
                     self.loss_func = prox_loss(self.mu)
                     self.test_loss_func = torch.nn.CrossEntropyLoss()
                     self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-                    self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)
-                    # # print(f"{self.rank}")               
+                    self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)          
 
                 # 加载服务器下发的参数（允许部分匹配）
                 missing, unexpected = self.model.load_state_dict(data['params'], strict=False)
                 self.log(f"Loaded params: missing={missing}, unexpected={unexpected}")
 
-                self.print_model_info()
+                # self.print_model_info()
                 # TODO:  没啥必要
                 self.set_parameter(data['params'], self.model)
-                # 增加宽度参数 TODO: 不需要每次分配
-                self.width = data['width']
                 self.status = data['status']
                 self.local_epochs = data['local_epochs']
                 self.straggler = data['straggler']
