@@ -32,6 +32,7 @@ class ProxServer(Server):
         self.widths = self.args.widths  # 支持的模型宽度
         self.width_assignment_strategy = self.args.width_assignment_strategy
         self.model_widths = {}  # 用于存储不同宽度的模型
+        self.clusters = {}  # 用于存储客户端的聚类信息/聚簇结果
 
     def generate_global_test_set(self):
         """
@@ -134,10 +135,10 @@ class ProxServer(Server):
         elif self.width_assignment_strategy == 'cluster':
             clusters = self.cluster_clients(self.all_clients)
             # 按簇分配
-            for cluster_id, cluster_clients in clusters.items():
+            for cluster_id, clustered_clients in clusters.items():
                 # 每个簇对应一个宽度
                 width = self.widths[cluster_id % len(self.widths)]
-                for client in cluster_clients:
+                for client in clustered_clients:
                     client.width = width
                     self.log(f"1st round, client {client.rank} assigned width: {client.width}")
         else:
@@ -190,9 +191,9 @@ class ProxServer(Server):
 
             # 更新簇中心: 对于每个簇, 根据簇内所有设备上传的本地模型参数进行聚合(类似模型聚合), 更新簇中心
             new_centroids = []
-            for cluster_id, cluster_clients in clusters.items():
-                if cluster_clients:
-                    avg_params = self.average_parameters([client.last_params for client in cluster_clients])
+            for cluster_id, clustered_clients in clusters.items():
+                if clustered_clients:
+                    avg_params = self.average_parameters([client.last_params for client in clustered_clients])
                     new_centroids.append(avg_params)
                 else:
                     # 如果某个簇为空, 保持原中心
@@ -203,6 +204,8 @@ class ProxServer(Server):
                 break
             centroids = new_centroids
 
+        # 存储并返回聚簇结果
+        self.clusters = clusters
         return clusters
 
     def average_parameters(self, params_list):
@@ -273,6 +276,9 @@ class ProxServer(Server):
         layer_aggregates = {weight: {key: torch.zeros_like(value) for key, value in global_state.items()} for weight in sorted_widths}
         # layer_weights = {weight: 0.0 for weight in sorted_widths}
 
+        # 获取聚簇结果
+        clusters = self.clusters
+
         # 按层级从低层到高层逐步聚合: [0.0, 0.25] --> [0.75, 1.0]
         # width_level: 每个层级最右端区间作为当前层级代表, 便于代码书写
         for idx, width_level in enumerate(sorted_widths):
@@ -281,6 +287,29 @@ class ProxServer(Server):
             total_weight = sum(client.train_samples for client in eligible_clients)
             if total_weight == 0:
                 continue
+
+            # 调整聚合权重
+            adjusted_weights = {}
+            for client in eligible_clients:
+                # find the cluster id of the client
+                cluster_id = None
+                for cid, clustered_clients in clusters.items():  # key: 簇id, value: 客户端列表
+                    if client in clustered_clients:
+                        cluster_id = cid
+                        break
+
+                if cluster_id is not None:
+                    # clients with same cluster id would be assigned higher weight
+                    delta_weight = 0.1  # 权重的增值
+                    adjusted_weights[client.rank] = client.train_samples / total_weight * (1 + delta_weight)
+                else:
+                    adjusted_weights[client.rank] = client.train_samples / total_weight
+
+            # normalize the adjusted weights
+            total_adjusted_weight = sum(adjusted_weights.values())
+            for client in eligible_clients:
+                adjusted_weights[client.rank] /= total_adjusted_weight
+
             # 提取所有客户端当前层级的参数然后累加: 比如当前层级为0.5, 那么就提取模型[0.25, 0.5]之间的params
             for client in eligible_clients:
                 # 第一个宽度层级直接提取该宽度下的参数
@@ -292,7 +321,7 @@ class ProxServer(Server):
                     current_params = self.extract_width_params(client.params, width_level)
                     delta_params = {key: current_params[key]-prev_params.get(key, 0) for key in current_params}  # 差异计算               
                 # 当前层级参数提取出来之后进行加权累加
-                weight = client.train_samples/total_weight
+                weight = adjusted_weights[client.rank]
                 for name in delta_params:
                     if name in layer_aggregates[width_level]:
                         layer_aggregates[width_level][name] += delta_params[name]*weight
@@ -317,32 +346,30 @@ class ProxServer(Server):
         """
         self.init_clients(clientObj=ProxClientInfo)
         self.generate_global_test_set()
-        # # TODO: assign width
-        # self.assign_widths()
         while True:
             # 第一轮随机分配宽度
-            print(f"Now, global round {self.global_round}")
+            print(f"Current global round: {self.global_round}.")
             if self.global_round == 0:
                 for client in self.all_clients:
                     client.width = random.choice(self.args.widths)
-                    self.log(f"0th round, client {client.rank} assigned width: {client.width}")
+                    self.log(f"0th round: client {client.rank} assigned width: {client.width}")
             elif self.global_round == 1:
                 # 第一轮按策略分配宽度, 之后不变
                 self.assign_widths()
-            print(f"Now, width assignment strategy: {self.width_assignment_strategy}")
+            print(f"Current width assignment strategy: {self.width_assignment_strategy}.")
             self.select_clients()
             self.get_and_set_stragglers()
             self.multi_width_broadcast()
-            print("Start calling listen() ...")
+            print("Start calling listen()...")
             self.listen()
             print("End calling listen().")
-            print("Start aggregating ...")
+            print("Start aggregating...")
             self.multi_width_aggregate(clients = self.selected_clients)
             print("End aggregating.")
             self.test(self.model, self.test_loader)
             self.average_client_info(self.selected_clients_idxes)
             self.finalize_round()
-            print(f"global_round {self.global_round-1} ends")
+            print(f"global_round {self.global_round-1} ends.")
             if self.global_round >= self.max_epochs:
                 print("???")
                 break

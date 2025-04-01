@@ -56,11 +56,19 @@ class prox_loss(torch.nn.Module):
         # 按名称对齐参数，跳过 BN 层
         local_params = dict(local_model.named_parameters())
         global_params = dict(global_model.named_parameters())
-        for name in local_params:
-            if name in global_params and 'bn' not in name:  # 跳过 BN 层
-                w = local_params[name]
-                w_star = global_params[name]
-                proximal_term += torch.norm(w - w_star, p=2)
+        for name, local_param in local_params.items():
+            # 跳过bn层
+            if 'bn' in name:
+                continue
+            # 如果参数名称在全局模型中存在, 则计算正则项
+            if name in global_params:
+                global_param = global_params[name]
+                if local_param.shape == global_param.shape:
+                    # 计算L2范数
+                    proximal_term += (local_param - global_param).norm(2)
+                else:
+                    self.log(f"Parameter shape mismatch for {name}: local {local_param.shape}, global {global_param.shape}")
+        # 计算正则化项
         total_loss = cross_entropy_loss + (self.mu / 2.0) * proximal_term
         return total_loss
     
