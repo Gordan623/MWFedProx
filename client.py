@@ -9,20 +9,23 @@ size = WORLD.Get_size()
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4)
 # 应对显卡分配问题：CUDA out of memory
-if rank < 28:
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4)
-else:
-    os.environ['CUDA_VISIBLE_DEVICES'] = str((rank-28) % 2 + 2)
+# if rank < 28:
+#     os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4 + 4)
+# else:
+#     os.environ['CUDA_VISIBLE_DEVICES'] = str((rank-28) % 2 + 2 + 4)
+os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4 + 4)
 
 import sys
 sys.path.append(".")
 sys.path.append("..") # Adds higher directory to python modules path.
-sys.path.append('../FLamingo/')
+sys.path.append('/data/yxli/FLamingo/')
 
 # Now import FLamingo
 from FLamingo.core.client import *
 from FLamingo.core.utils.train_test_utils import infinite_dataloader
-from model_utils import create_model_instance
+from FLamingo.core.utils.data_utils import ClientDataset
+from utils.model_utils import create_model_instance
+from FLamingo.core.utils.chores import merge_several_dicts
 import torch.nn.functional as F
 import copy
 
@@ -101,6 +104,10 @@ class FedProxClient(Client):
         self.params = None
         self.train_samples = None
         self.local_iteration = None
+        self.network = NetworkHandler()
+        self.dataset = ClientDataset(self.dataset_type, self.data_dir, self.rank)
+        self.train_loader = self.dataset.get_train_loader(self.batch_size)
+        self.test_loader = self.dataset.get_test_loader(self.test_batch_size)
         
 
     def train(self):
@@ -138,7 +145,6 @@ class FedProxClient(Client):
             'train_samples': num_samples,
             'train_time': train_time
         }
-
     
     def set_parameter(self, params_dict, model = None):
         """
@@ -154,72 +160,73 @@ class FedProxClient(Client):
         """
         Client jobs.
         """
+        data = self.listen()
+        self.width = data['width']       
+        self.local_iteration = data['local_iteration']
+        self.state_dict = data['state_dict']
+        del self.model, self.optimizer, self.lr_scheduler
+        self.model = create_model_instance(self.model_type, self.dataset_type, self.width).to(self.device)
+        self.loss_func = prox_loss(self.mu)
+        self.test_loss_func = torch.nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4)
+        self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)
+
         while True:
             # get from server
             data = self.listen()
             if data['status'] == 'TRAINING':
-                
-                # 判断是否为首次初始化
-                if self.width != data['width'] or self.model is None:
-                    # print(f"before init, for rank {rank}, self.width = {self.width}, data['width'] = {data['width']}")
-                    # 首次初始化需要init_model
-                    self.width = data['width']
-                    # print(f"after init, for rank {rank}, self.width = {self.width}, data['width'] = {data['width']}")
-                    
-                    # ↑宽度已正确传输↑
-                    self.local_iteration = data['local_iteration']
-                    
-                    # TODO: change model width
-                    del self.model, self.optimizer, self.lr_scheduler
-                    # torch.cuda.empty_cache()
-                    # data = self.listen()
-                    # self.width = data['width']
-                    # TODO: re-init model
-                    self.model = create_model_instance(self.model_type, self.dataset_type, self.width)
-                    self.model = self.model.to(self.device)
-                    self.loss_func = prox_loss(self.mu)
-                    self.test_loss_func = torch.nn.CrossEntropyLoss()
-                    self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-                    self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)          
-
-                # 加载服务器下发的参数（允许部分匹配）
-                missing, unexpected = self.model.load_state_dict(data['params'], strict=False)
-                self.log(f"Loaded params: missing={missing}, unexpected={unexpected}")
-
-                # self.print_model_info()
-                # TODO:  没啥必要
-                self.set_parameter(data['params'], self.model)
+                print(f"Client stopping...")
+                global_round = data['global_round']      
+                # 前两轮打印模型信息
+                if global_round < 2:
+                    self.log(f"[Round {global_round}] Client {self.rank} model info:")
+                    self.print_model_info()
+                self.model.load_state_dict(data['state_dict'])
                 self.status = data['status']
                 self.local_epochs = data['local_epochs']
                 self.straggler = data['straggler']
                 self.log(f"I'm {'straggler' if self.straggler else 'not straggler'}, training with width {self.width}, local epochs {self.local_epochs}")
-                bf_test_dic = self.test(
-                    self.model, self.test_loader, self.test_loss_func, self.device)
-                train_dic = self.train()
-                # self.log("Training finish.")
-                af_test_dic = self.test(
-                    self.model, self.test_loader, self.test_loss_func, self.device)
-                data_to_send = merge_several_dicts(
-                    [af_test_dic, train_dic]
-                )
-                data_to_send.update({
-                    'bf_acc': bf_test_dic['test_acc'],
-                    'width': self.width,
-                    'bf_loss': bf_test_dic['test_loss'],
-                    'params': self.model.state_dict()
-                })
-                # -----2025.03.20修改-----
+
+
+                print(f"Client {self.rank} starts training & testing...")
+                trained_info = self.train_iters(
+                    self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iters)
+                tested_info = self.test(
+                    self.model, self.test_loader, self.loss_func, self.device)   
+                print(f"Client {self.rank} finished training & testing.")            
+
+                data_to_send = merge_several_dicts([trained_info, tested_info])
+                # self.log(f"send data: {data_to_send}")
+                # data_to_send['state_dict'] = self.model.state_dict()
+
+                # bf_test_dic = self.test(
+                #     self.model, self.test_loader, self.test_loss_func, self.device)
+                # train_dic = self.train()
+
+                # af_test_dic = self.test(
+                #     self.model, self.test_loader, self.test_loss_func, self.device)
+                # data_to_send = merge_several_dicts(
+                #     [af_test_dic, train_dic]
+                # )
+                # data_to_send.update({
+                #     'bf_acc': bf_test_dic['test_acc'],
+                #     'width': self.width,
+                #     'bf_loss': bf_test_dic['test_loss'],
+                #     'params': self.model.state_dict()
+                # })
                 self.params = data_to_send['params']
-                # -----------------------
                 self.send(data_to_send)
-                # self.log("Send success")
             elif data['status'] == 'STOP':
                 print('stop training...')
                 break
             
             # finish the round as you wish
             self.finalize_round()
+            if self.global_round >= self.max_epochs:
+                if self.verb: self.log(f'Reaching epochs limit {self.max_epochs}')
+                break
         # out of the loop
+        if self.verb: self.log(f'finished at round {self.global_round}')
         print('stopped')
 
 

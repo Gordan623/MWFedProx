@@ -47,7 +47,7 @@ def parse_log(log_path):
     return df
 
 # 解析日志
-df = parse_log("./runs/cifar10/2025-04-01-13-56-02/server.log")
+df = parse_log("./runs/cifar10/2025-04-08-width-1.0/server.log")
 
 
 import os
@@ -84,7 +84,7 @@ def plot_training_curves(df):
     # 保存
     output_dir = "./charts"
     os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "chart-2025-04-01-13-56-02.png")
+    output_file = os.path.join(output_dir, "chart-2025-04-08-width-1.0.png")
     plt.savefig(output_file)
     plt.show()
 
