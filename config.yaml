@@ -12,12 +12,12 @@ run_dir: './runs/cifar10/test_1'
 ## Training settings
 seed: 2024  # random seed
 batch_size: 32  # batch size
-test_batch_size: 32  # test batch size
+test_batch_size: 64  # test batch size
 lr: 0.1  # learning rate
 weight_decay: 5e-4  # weight decay
 max_epochs: 500  # epoch
 dropout: 0.5  # dropout rate
-local_iteration: 500  # local iteration
+local_iteration: 50  # local iteration
 momentum: 0.9
 
 ## Federated learning settings
@@ -41,7 +41,7 @@ local_epochs: 1  # max local epochs to choose from
 
 # multi-width
 widths: [0.25, 0.5, 0.75, 1.0]  # supported model widths
-width_assignment_strategy: random  # width_assignment_strategy: strategy for assigning widths to clients
+width_assignment_strategy: ordered  # width_assignment_strategy: strategy for assigning widths to clients
 
 USE_SIM_SYSHET: False
 USE_TENSORBOARD: False

@@ -21,101 +21,98 @@ from torch.utils.data import DataLoader
 # from algorithms import broadcast, aggregate
 from collections import defaultdict
 from utils.model_utils import *
+from utils.custom_models import create_model_instance
 
 class ProxClientInfo(ClientInfo):
     def __init__(self, rank):
         super().__init__(rank)
-        self.bf_acc = 0.0
-        self.bf_loss = 0.0
-        self.is_straggler = False
-        self.local_epochs = 10
         self.width = 1.0  # 添加宽度属性
-        self.last_params = None  # 用于存储上次的参数
         self.state_dict = None
+        self.datasize = 1
+        self.model = None
 
 class ProxServer(Server):
     def init(self):
-        self.widths = sorted(self.args.widths)  # 支持的模型宽度
-        self.width_assignment_strategy = self.args.width_assignment_strategy
-        self.model = create_model_instance(self.model_type, self.dataset_type, 1.0).to(self.device)  # 创建全局模型实例
-        self.clusters = {}  # 用于存储客户端的聚类信息/聚簇结果
-        self.network = NetworkHandler()
-        if hasattr(self, 'momentum') and self.args.momentum is not None:
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum)
-        else:
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr)
-        self.loss_func = torch.nn.CrossEntropyLoss()
         self.model_dict = {}
         self.model_kwargs = {
             'model_type': self.model_type,
             'dataset_type': self.dataset_type
         }
+        self.widths = sorted(self.args.widths)  # 支持的模型宽度
+        print(self.widths)
+        self.model = create_model_instance(self.model_type, self.dataset_type, 1.0).to(self.device)  # 创建全局模型实例 
         for width in self.widths:
-            cur_model = slice_model(self.model, width, self.device, 
-                                                **self.model_kwargs)
+            cur_model = slice_model(self.model, width, self.device, **self.model_kwargs)
             self.model_dict[width] = cur_model
-
-    def generate_global_test_set(self):
-        """
-        Generate a global test set.
-        """
-        if self.dataset_type == 'mnist':
-            self.test_set = MNIST(root='../datasets', train=False, download=True, transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,))
-            ]))
-        elif self.dataset_type == 'cifar10':
-            self.test_set = CIFAR10(root='../datasets', train=False, download=True, transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-            ]))
-        elif self.dataset_type == 'emnist':
-            self.test_set = EMNIST(root='../datasets', split='balanced', train=False, download=True, transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,))
-            ]))
-        self.test_loader = DataLoader(
-            dataset=self.test_set, batch_size=self.args.batch_size, shuffle=False)
+        self.model.to(self.device)
+        self.network = NetworkHandler()
+        self.loss_func = nn.CrossEntropyLoss() if self.dataset_type in ['mnist', 'cifar10'] else nn.BCEWithLogitsLoss()
+        self.width_assignment_strategy = self.args.width_assignment_strategy
         
-    def test(self, model, test_loader):
-        """
-        Test the model.
-        """
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = model(data)
-                test_loss += self.loss_func(output, target).item()
-                pred = output.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
-        test_loss /= len(test_loader.dataset)
-        accuracy = 100. * correct / len(test_loader.dataset)
-        self.log(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.0f}%)')
-        return {'test_loss': test_loss, 'accuracy': accuracy}
+
+    # def generate_global_test_set(self):
+    #     """
+    #     Generate a global test set.
+    #     """
+    #     if self.dataset_type == 'mnist':
+    #         self.test_set = MNIST(root='../datasets', train=False, download=True, transform=transforms.Compose([
+    #             transforms.ToTensor(),
+    #             transforms.Normalize((0.1307,), (0.3081,))
+    #         ]))
+    #     elif self.dataset_type == 'cifar10':
+    #         self.test_set = CIFAR10(root='../datasets', train=False, download=True, transform=transforms.Compose([
+    #             transforms.ToTensor(),
+    #             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #         ]))
+    #     elif self.dataset_type == 'emnist':
+    #         self.test_set = EMNIST(root='../datasets', split='balanced', train=False, download=True, transform=transforms.Compose([
+    #             transforms.ToTensor(),
+    #             transforms.Normalize((0.1307,), (0.3081,))
+    #         ]))
+    #     self.test_loader = DataLoader(
+    #         dataset=self.test_set, batch_size=self.args.batch_size, shuffle=False)
+        
+    # def test(self, model, test_loader):
+    #     """
+    #     Test the model.
+    #     """
+    #     model.eval()
+    #     test_loss = 0.0
+    #     correct = 0
+    #     num_samples = 0
+    #     with torch.no_grad():
+    #         for data, target in test_loader:
+    #             data, target = data.to(self.device), target.to(self.device)
+    #             output = model(data)
+    #             test_loss += self.loss_func(output, target).item()
+    #             pred = output.argmax(dim=1, keepdim=True)
+    #             correct += pred.eq(target.view_as(pred)).sum().item()
+    #             num_samples += len(target)
+    #     test_loss /= len(test_loader.dataset)
+    #     accuracy = 100. * correct / len(test_loader.dataset)
+    #     self.log(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.0f}%)')
+    #     return {'test_loss': test_loss, 'test_acc': accuracy, 'test_samples': num_samples}
     
-    def average_client_info(self, client_list):
-        """
-        Average client info and log it
-        """
-        length = len(client_list)
-        clients = [self.get_client_by_rank(rank) for rank in client_list]
-        avg_train_loss = 0.0
-        avg_test_loss, avg_test_acc = 0.0, 0.0
-        avg_bf_test_acc, avg_bf_test_loss = 0.0, 0.0
-        for client in clients:
-            avg_train_loss += client.train_loss
-            avg_test_acc += client.test_acc
-            avg_test_loss += client.test_loss
-            avg_bf_test_acc += client.bf_acc 
-            avg_bf_test_loss += client.bf_loss
-        self.log(f"Avg global info:\ntrain loss {avg_train_loss/length}, \
-                \ntest acc {avg_test_acc/length}, \
-                \ntest loss {avg_test_loss/length},\
-                \navg_bf_test_acc {avg_bf_test_acc/length}, \
-                \navg_bf_test_loss {avg_bf_test_loss/length} ")
+    # def average_client_info(self, client_list):
+    #     """
+    #     Average client info and log it
+    #     """
+    #     length = len(client_list)
+    #     clients = [self.get_client_by_rank(rank) for rank in client_list]
+    #     avg_train_loss = 0.0
+    #     avg_test_loss, avg_test_acc = 0.0, 0.0
+    #     avg_bf_test_acc, avg_bf_test_loss = 0.0, 0.0
+    #     for client in clients:
+    #         avg_train_loss += client.train_loss
+    #         avg_test_acc += client.test_acc
+    #         avg_test_loss += client.test_loss
+    #         avg_bf_test_acc += client.bf_acc 
+    #         avg_bf_test_loss += client.bf_loss
+    #     self.log(f"Avg global info:\ntrain loss {avg_train_loss/length}, \
+    #             \ntest acc {avg_test_acc/length}, \
+    #             \ntest loss {avg_test_loss/length},\
+    #             \navg_bf_test_acc {avg_bf_test_acc/length}, \
+    #             \navg_bf_test_loss {avg_bf_test_loss/length} ")
         
     def get_and_set_stragglers(self):
         """
@@ -129,7 +126,7 @@ class ProxServer(Server):
         for rank in self.stragglers_idxes:
             self.get_client_by_rank(rank).is_straggler = True
             self.get_client_by_rank(rank).local_epochs = random.choice(range(1, self.local_epochs+1))
-            self.log(f"Client {rank} gets {self.get_client_by_rank(rank).local_epochs} epochs and width {self.get_client_by_rank(rank).width}")
+            # self.log(f"Client {rank} gets {self.get_client_by_rank(rank).local_epochs} epochs and width {self.get_client_by_rank(rank).width}")
         for rank in self.non_stragglers_idxes:
             self.get_client_by_rank(rank).is_straggler = False
             self.get_client_by_rank(rank).local_epochs = self.local_epochs
@@ -149,18 +146,21 @@ class ProxServer(Server):
                 client.width = random.choice(self.args.widths)
                 client.state_dict = self.model_dict[client.width].state_dict()
                 self.log(f"1st round, client {client.rank} assigned width: {client.width}")
+            return 
         elif self.width_assignment_strategy == 'ordered':
-            for rank in self.selected_clients_idxes:
-                client = self.get_client_by_rank(rank)
-                client.width = self.widths[rank%len(self.widths)]
+            for i in range(1, self.num_clients+1):
+                client = self.get_client_by_rank(i)
+                client.width = self.widths[i % len(self.widths)]
                 client.state_dict = self.model_dict[client.width].state_dict()
-                self.log(f"1st round, client {client.rank} assigned width: {client.width}")
+                self.log(f'client {i} width: {client.width}')
+            return
         elif self.width_assignment_strategy == 'fixed':
             for rank in self.selected_clients_idxes:
                 client = self.get_client_by_rank(rank)
                 client.width = self.widths[0]
                 client.state_dict = self.model_dict[client.width].state_dict()
                 self.log(f"1st round, client {client.rank} assigned width: {client.width}")
+            return
         elif self.width_assignment_strategy == 'cluster':
             clusters = self.cluster_clients(self.all_clients)
             # 按簇分配
@@ -171,6 +171,7 @@ class ProxServer(Server):
                     client.width = width
                     client.state_dict = self.model_dict[client.width].state_dict()
                     self.log(f"1st round, client {client.rank} assigned width: {client.width}")
+            return
         else:
             raise ValueError(f"Unknown width assignment strategy: {self.width_assignment_strategy}")
 
@@ -279,20 +280,23 @@ class ProxServer(Server):
         for client in self.selected_clients:
             # 动态生成与客户端宽度兼容的参数字典
             # compatible_params = self.extract_width_params(self.model.state_dict(), client.width)
-            compatible_params = self.model.state_dict()
-            self.network.send(
-                data = {
-                    'status': 'TRAINING',
-                    'params': compatible_params,
-                    'width': client.width,
-                    'local_epochs': self.local_epochs,
-                    'straggler': client.is_straggler,
-                    'global_round': self.global_round,
-                    'local_iteration': self.local_iteration,
-                    'state_dict': client.state_dict,
-                },
-                dest_rank = client.rank
+            compatible_model = slice_model(
+                self.model, 
+                client.width, 
+                self.device,
+                self.model_type, 
+                self.dataset_type
             )
+            compatible_params = compatible_model.state_dict()  # ✅ 适配参数
+            data_to_send = {
+                'status': 'TRAINING',
+                'params': compatible_params,
+                'straggler': client.is_straggler,
+                'state_dict': client.state_dict,
+                'global_round': self.global_round,
+            }
+            self.network.send(data=data_to_send, dest_rank = client.rank)
+            # print(f"Server sending data to client {client.rank}: {data_to_send}")  # 添加调试信息
             print(f"Server broadcast to client {client.rank} succeed")
             # dest_ranks.add(client.rank)
         if self.verb:
@@ -505,15 +509,13 @@ class ProxServer(Server):
         global_model_copy = copy.deepcopy(self.model)
         
         # 执行新聚合
-        aggregated_model = model_aggregation(
+        self.model = model_aggregation(
             clients=clients,
             client_widths_input=client_widths,
             global_model=global_model_copy
         )
         
-        # 更新全局模型
-        self.model.load_state_dict(aggregated_model.state_dict())
-        
+
         # 保持原有逻辑：保存参数供聚类使用
         for client in self.selected_clients:
             client.last_params = copy.deepcopy(client.params)
@@ -525,53 +527,48 @@ class ProxServer(Server):
         and wait for next round
         """
         self.init_clients(clientObj=ProxClientInfo)
+        self.assign_widths()
         self.generate_global_test_set()
+        self.select_clients()
+        self.personalized_broadcast(
+            common_data={'status': 'INIT'},
+            personalized_attr=['state_dict', 'width']
+        )
         while True:
-            # 第一轮随机分配宽度
             print(f"Current global round: {self.global_round}.")
-            if self.global_round == 0:
-                for client in self.all_clients:
-                    client.width = random.choice(self.args.widths)
-                    client.state_dict = self.model_dict[client.width].state_dict()
-                    self.log(f"0th round: client {client.rank} assigned width: {client.width}")
-            elif self.global_round == 1:
-                # 第一轮按策略分配宽度, 之后不变
-                self.assign_widths()
-            print(f"Current width assignment strategy: {self.width_assignment_strategy}.")
-            self.select_clients()
-            for client in self.selected_clients:
-                client.state_dict = slice_model(
-                    self.model, client.width, self.device,
-                    **self.model_kwargs).state_dict()
             self.get_and_set_stragglers()
-            self.multi_width_broadcast()
+
+            for client in self.selected_clients:
+                client.state_dict = slice_model(self.model, client.width, self.device, **self.model_kwargs).state_dict()
+
+            self.personalized_broadcast(
+                common_data={'status': 'TRAINING'},
+                personalized_attr=['state_dict', 'is_straggler'],
+            )
 
             print("Start calling listen()...")
             self.listen()
             print("End calling listen().")
 
-            # 调用自定义的多宽度聚合函数
-            device_updates = []
-            for client in self.selected_clients:
-                device_updates.append({
-                    'params': client.params,
-                    'width': client.width,
-                    'train_samples': client.train_samples
-                })
-
             print("Start aggregating...")
-            self.model = self.multi_width_aggregate(clients=self.selected_clients)
+            # self.multi_width_aggregate(clients=self.selected_clients)
+            self.model = model_aggregation(
+                self.selected_clients,
+                self.widths,
+                self.model
+            )
             print("End aggregating.")
             
             print("Start evaluating...")
             # self.test(self.model, self.test_loader)
-            for width in self.width_list:
-                test_model = slice_model(self.model, width, self.device,
-                                         self.model_type, self.dataset_type)
+            for width in self.widths:
+                test_model = slice_model(self.model, width, self.device, self.model_type, self.dataset_type)
                 test_dic = self.test(test_model, self.test_loader)
                 self.log(f'width:{width}=====test acc: {test_dic["test_acc"]}, test_loss: {test_dic["test_loss"]}')
             print("End evaluating.")
+
             self.average_client_info(self.selected_clients_idxes)
+
             self.finalize_round()
             print(f"global_round {self.global_round-1} ends.")
             if self.global_round >= self.max_epochs:

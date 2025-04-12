@@ -139,50 +139,50 @@ class NaNCheckModule(nn.Module):
 
         return x
 
-class MWAlexNet(nn.Module):
-    # 增加了width
-    def __init__(self, width, class_num=10):
-        super(MWAlexNet, self).__init__()
-        self.width = width
+class AlexNet(nn.Module):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5, width: float = 1.0) -> None:
+        super().__init__()
+        def adjust_channels(channels: int) -> int:
+            return max(1, int(channels * width))
         self.features = nn.Sequential(
             # 3 32 32
-            nn.Conv2d(3, int(64*width), kernel_size=3, stride=2, padding=1),  # kernel_size=3 && padding=1表示矩阵大小不变
+            nn.Conv2d(3, adjust_channels(64), kernel_size=3, stride=2, padding=1),
             # 64 32+2-2=32 32/2=16
             nn.ReLU(inplace=True),
             # 64 16 16
-            nn.MaxPool2d(kernel_size=2),  # kernel_size=2 表示矩阵大小减半(缩水"一半")
+            nn.MaxPool2d(kernel_size=2),
             # 64 8 8
-            nn.Conv2d(int(64*width), int(192*width), kernel_size=3, padding=1),
+            nn.Conv2d(adjust_channels(64), adjust_channels(192), kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 192 8 8
             nn.MaxPool2d(kernel_size=2),
             # 192 4 4
-            nn.Conv2d(int(192*width), int(384*width), kernel_size=3, padding=1),
+            nn.Conv2d(adjust_channels(192), adjust_channels(384), kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 384 4 4
-            nn.Conv2d(int(384*width), int(256*width), kernel_size=3, padding=1),
+            nn.Conv2d(adjust_channels(384), adjust_channels(256), kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 256 4 4
-            nn.Conv2d(int(256*width), int(256*width), kernel_size=3, padding=1),
+            nn.Conv2d(adjust_channels(256), adjust_channels(256), kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2),
             # 256 2 2
         )
         self.classifier = nn.Sequential(
-            nn.Dropout(),
-            nn.Linear(int(256*width) * 2 * 2, int(1024*width)),
+            nn.Dropout(dropout),
+            nn.Linear(adjust_channels(256) * 2 * 2, adjust_channels(1024)),
             nn.ReLU(inplace=True),
-            nn.Dropout(),
-            nn.Linear(int(1024*width), int(512*width)),
+            nn.Dropout(dropout),
+            nn.Linear(adjust_channels(1024), adjust_channels(512)),
             nn.ReLU(inplace=True),
-            nn.Linear(int(512*width), class_num),
+            nn.Linear(adjust_channels(512), num_classes),
         )
+
     def forward(self, x):
         x = self.features(x)
-        # x = x.view(-1, int(256*self.width) * 2 * 2)
-        x = x.view(x.size(0), -1)  # 自动展平，避免手动计算错误
+        x = torch.flatten(x, 1)
         x = self.classifier(x)
-        # print("features output shape:", x.shape)
+        # return F.log_softmax(x, dim=1)
         return x
     
 
