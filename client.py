@@ -85,73 +85,7 @@ class FedProxClient(Client):
     """
 
     def init(self):
-        """
-        self.width = 1.0
-        self.model = create_model_instance(self.model_type, self.dataset_type, self.width)
-        self.model = self.model.to(self.device)
-        self.loss_func = prox_loss(self.mu)
-        self.test_loss_func = torch.nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-        self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)
-        """
-        
-        # self.width = None
-        # self.model = None
-        # self.loss_func = None
-        # self.test_loss_func = None
-        # self.optimizer = None
-        # self.lr_scheduler = None
-        # self.params = None
-        # self.train_samples = None
-        # self.local_iteration = None
         self.network = NetworkHandler()
-        
-
-    # def train(self):
-    #     """
-    #     Use costumized loss func to train.
-    #     """
-    #     model, train_loader = self.model, self.train_loader
-    #     global_model = copy.deepcopy(model)
-    #     model.train()
-    #     epoch_loss, num_samples = 0.0, 0
-    #     train_start_time = time.time()  # 记录训练开始时间
-    #     inf_loader = infinite_dataloader(train_loader)
-    #     # 按迭代次数训练
-    #     for iter in range(self.local_iteration):
-    #         data, target = next(inf_loader)
-    #         data, target = data.to(self.device), target.to(self.device)
-
-    #         self.optimizer.zero_grad()  
-    #         output = model(data)
-
-    #         loss = self.loss_func(output, target, model, global_model)
-
-    #         loss.backward()  
-    #         self.optimizer.step()
-
-    #         epoch_loss += loss.item() * data.size(0)
-    #         num_samples += data.size(0)
-    #     if self.lr_scheduler is not None:
-    #         self.lr_scheduler.step()  # 更新学习率
-    #     train_end_time = time.time()  # 记录训练结束时间
-    #     train_time = train_end_time - train_start_time  # 计算训练时间
-    #     self.train_samples = num_samples
-    #     return {
-    #         'train_loss': epoch_loss / num_samples,
-    #         'train_samples': num_samples,
-    #         'train_time': train_time
-    #     }
-    
-    # def set_parameter(self, params_dict, model = None):
-    #     """
-    #     Set model parameters from a dictionary of parameters.
-    #     Args:
-    #         params_dict: Dictionary containing parameter names and values.
-    #         model: Model to set parameters for. Defaults to self.model.
-    #     """
-    #     model = self.model if model is None else model
-    #     model.load_state_dict(params_dict)
 
     def run(self):
         """
