@@ -87,6 +87,54 @@ class FedProxClient(Client):
     def init(self):
         self.network = NetworkHandler()
 
+
+    def train_iters(self, model, dataloader, loss_func, optimizer, scheduler=None, iters=None):
+        """
+        Train given dataset on given dataloader with given iters.
+        Args:
+            model: model to be trained
+            dataloader: dataloader for the dataset
+            loss_func: loss function
+            optimizer: optimizer
+            scheduler: default None, learning rate scheduler, lr will be consistent if not given
+            iters: number of iterations
+        Return:
+            dict: train_loss, train_samples, train_time
+        """
+        model.train()
+        epoch_loss, num_samples = 0.0, 0
+        s_t = time.time()
+        num_batches = 0
+        inf_loader = infinite_dataloader(dataloader)
+        if iters is None:
+            iters = self.args.local_iteration
+
+        for i in range(iters):
+            data, target = next(inf_loader)
+            data, target = data.to(self.device), target.to(self.device)
+            optimizer.zero_grad()  
+            output = model(data)
+            loss = loss_func(output, target)
+            loss.backward()  
+            optimizer.step() 
+            batch_num_samples = len(target)
+            epoch_loss += loss.item() * batch_num_samples  
+            num_samples += batch_num_samples
+            num_batches += 1
+        if scheduler is not None:
+            scheduler.step()  # 更新学习率
+        
+        if self.USE_SIM_SYSHET:
+            train_time = num_batches * self.rand_comp()
+        else:
+            train_time = time.time() - s_t
+
+        # tcp = train_time
+
+        # return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time, 'tcp': tcp}
+        return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time}
+
+
     def run(self):
         """
         Client jobs.
@@ -94,6 +142,7 @@ class FedProxClient(Client):
         data = self.listen()
         self.width = data['width']       
         self.state_dict = data['state_dict']
+        # self.tau = data['tau']
         self.model = create_model_instance(self.model_type, self.dataset_type, self.width).to(self.device)
         self.model.load_state_dict(self.state_dict)
         self.loss_func = torch.nn.CrossEntropyLoss() if self.dataset_type in ['mnist', 'cifar10'] else torch.nn.BCEWithLogitsLoss()
@@ -113,16 +162,16 @@ class FedProxClient(Client):
             elif data['status'] == 'TRAINING':
                 self.model.load_state_dict(data['state_dict'])
                 trained_info = self.train_iters(
-                    self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iteration)
+                    # self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.tau
+                    self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iteration
+                    )
                 tested_info = self.test(
                     self.model, self.test_loader, self.loss_func, self.device)
                 # Construct data to send
                 data_to_send = merge_several_dicts([trained_info, tested_info])
                 self.log(f"send data: {data_to_send}")
                 data_to_send['state_dict'] = self.model.state_dict()
-                # self.network.send(data_to_send, self.MASTER_RANK)
                 self.send(data_to_send)
-                # if self.verb: self.log('training finished')
             else:
                 raise Exception('Unknown status')
             

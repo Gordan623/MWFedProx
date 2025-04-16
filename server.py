@@ -48,71 +48,15 @@ class ProxServer(Server):
         self.network = NetworkHandler()
         self.loss_func = nn.CrossEntropyLoss() if self.dataset_type in ['mnist', 'cifar10'] else nn.BCEWithLogitsLoss()
         self.width_assignment_strategy = self.args.width_assignment_strategy
-        
 
-    # def generate_global_test_set(self):
-    #     """
-    #     Generate a global test set.
-    #     """
-    #     if self.dataset_type == 'mnist':
-    #         self.test_set = MNIST(root='../datasets', train=False, download=True, transform=transforms.Compose([
-    #             transforms.ToTensor(),
-    #             transforms.Normalize((0.1307,), (0.3081,))
-    #         ]))
-    #     elif self.dataset_type == 'cifar10':
-    #         self.test_set = CIFAR10(root='../datasets', train=False, download=True, transform=transforms.Compose([
-    #             transforms.ToTensor(),
-    #             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    #         ]))
-    #     elif self.dataset_type == 'emnist':
-    #         self.test_set = EMNIST(root='../datasets', split='balanced', train=False, download=True, transform=transforms.Compose([
-    #             transforms.ToTensor(),
-    #             transforms.Normalize((0.1307,), (0.3081,))
-    #         ]))
-    #     self.test_loader = DataLoader(
-    #         dataset=self.test_set, batch_size=self.args.batch_size, shuffle=False)
-        
-    # def test(self, model, test_loader):
-    #     """
-    #     Test the model.
-    #     """
-    #     model.eval()
-    #     test_loss = 0.0
-    #     correct = 0
-    #     num_samples = 0
-    #     with torch.no_grad():
-    #         for data, target in test_loader:
-    #             data, target = data.to(self.device), target.to(self.device)
-    #             output = model(data)
-    #             test_loss += self.loss_func(output, target).item()
-    #             pred = output.argmax(dim=1, keepdim=True)
-    #             correct += pred.eq(target.view_as(pred)).sum().item()
-    #             num_samples += len(target)
-    #     test_loss /= len(test_loader.dataset)
-    #     accuracy = 100. * correct / len(test_loader.dataset)
-    #     self.log(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.0f}%)')
-    #     return {'test_loss': test_loss, 'test_acc': accuracy, 'test_samples': num_samples}
-    
-    # def average_client_info(self, client_list):
-    #     """
-    #     Average client info and log it
-    #     """
-    #     length = len(client_list)
-    #     clients = [self.get_client_by_rank(rank) for rank in client_list]
-    #     avg_train_loss = 0.0
-    #     avg_test_loss, avg_test_acc = 0.0, 0.0
-    #     avg_bf_test_acc, avg_bf_test_loss = 0.0, 0.0
-    #     for client in clients:
-    #         avg_train_loss += client.train_loss
-    #         avg_test_acc += client.test_acc
-    #         avg_test_loss += client.test_loss
-    #         avg_bf_test_acc += client.bf_acc 
-    #         avg_bf_test_loss += client.bf_loss
-    #     self.log(f"Avg global info:\ntrain loss {avg_train_loss/length}, \
-    #             \ntest acc {avg_test_acc/length}, \
-    #             \ntest loss {avg_test_loss/length},\
-    #             \navg_bf_test_acc {avg_bf_test_acc/length}, \
-    #             \navg_bf_test_loss {avg_bf_test_loss/length} ")
+        # # 新增FedSNN相关参数
+        # self.cluster_num = int(self.num_clients / len(self.widths))
+        # self.cluster_centers = [None] * self.cluster_num
+        # self.max_cluster_iter = self.args.max_cluster_iter
+        # self.tau = {rank: self.args.local_iteration for rank in range(1, self.num_clients+1)}  # 保存客户端tau值
+        # self.tcp_history = defaultdict(list)  # 保存客户端计算时间
+        # self.tcm_history = defaultdict(list)  # 保存客户端通信时间
+
         
     def get_and_set_stragglers(self):
         """
@@ -174,43 +118,100 @@ class ProxServer(Server):
             return
         else:
             raise ValueError(f"Unknown width assignment strategy: {self.width_assignment_strategy}")
-        
+    
+    def flatten_paras(self, params):
+        """
+        将模型的参数展平为一维向量
+        Args:
+            params: 模型的参数列表
+        Returns:
+            flatten_params: 展平后的参数向量
+        """
+        flatten_params = []
+        for p in params:
+            flatten_params.append(torch.reshape(p.data.clone().detach(), [-1]))
+        return torch.cat(flatten_params)
+
     def cluster_clients(self, clients):
         """
         Cluster clients based on their data size.
+        算法流程:
+        Args:
+            clients: 客户端列表
         """
-        clusters = defaultdict(list)
+        # 1. 初始化聚类中心
+        if not any(self.cluster_centers):
+            count = 0
+            for client in clients:
+                if client.width == 1.0:
+                    self.cluster_centers[count] = copy.deepcopy(client.model)
+                    count += 1
+                    if count == self.cluster_num:
+                        break
+
+        # 2. 迭代聚类
+        for _ in range(self.max_cluster_iter):
+            # 计算余弦相似度
+            distance_matrix = torch.zeros((len(clients), self.cluster_num))  # 距离矩阵
+            for i, client in enumerate(clients):
+                client_model = slice_model(client.model, client.width, self.device, **self.model_kwargs)
+                for j in range(self.cluster_num):
+                    centroid_model = slice_model(self.cluster_centers[j], client.width, self.device, **self.model_kwargs)
+                    distance_matrix[i][j] = torch.cosine_similarity(  # distance_matrix[i][j]表示第i个客户端与第j个聚簇中心的余弦相似度
+                        self.flatten_paras(client_model.parameters()),
+                        self.flatten_paras(centroid_model.parameters()),
+                        dim=0
+                    )
+
+            # 分配设备到聚类
+            cluster_assignments = torch.argmax(distance_matrix, dim=1)  # 每个客户端分配到的聚类
+
+            # 更新聚类中心
+            for j in range(self.cluster_num):
+                cluster_models = [clients[i].model for i in np.where(cluster_assignments == j)[0]]
+                if cluster_models:
+                    # 计算聚类中心
+                    cluster_center = model_aggregation(
+                        clients=cluster_models,
+                        client_widths_input=[clients[i].width for i in np.where(cluster_assignments == j)[0]],
+                        global_model=self.model
+                    )
+                    self.cluster_centers[j] = cluster_center
+
+
+    def dynamic_tau_adjustment(self, clients):
+        """动态tau调整策略"""
+        # 计算时间因子（最后3轮平均值）
+        tcp = {c.rank: np.mean(self.tcp_history[c.rank][-3:]) for c in clients}
+        tcm = {c.rank: np.mean(self.tcm_history[c.rank][-3:]) for c in clients}
+        
+        # 计算最大epoch时间
+        max_time = max(
+            tcm[c.rank] + (10/self.tau[c.rank])*tcp[c.rank] 
+            for c in clients
+        )
+        
+        # 调整tau值
         for client in clients:
-            clusters[client.datasize].append(client)
-        return clusters
+            new_tau = int((max_time - tcm[client.rank]) * self.tau[client.rank] / (tcp[client.rank]/2))
+            self.tau[client.rank] = np.clip(new_tau, 50, 200)
+            # 保持与FedProx本地迭代次数的兼容
+            client.tau = self.tau[client.rank]
+
 
     def multi_width_broadcast(self):
         """
         按客户端宽度生成兼容参数并广播
         """
-        # dest_ranks = {''}
         for client in self.selected_clients:
-            # 动态生成与客户端宽度兼容的参数字典
-            # compatible_params = self.extract_width_params(self.model.state_dict(), client.width)
-            compatible_model = slice_model(
-                self.model, 
-                client.width, 
-                self.device,
-                self.model_type, 
-                self.dataset_type
-            )
-            compatible_params = compatible_model.state_dict()  # ✅ 适配参数
-            data_to_send = {
-                'status': 'TRAINING',
-                'params': compatible_params,
-                'straggler': client.is_straggler,
-                'state_dict': client.state_dict,
-                'global_round': self.global_round,
-            }
-            self.network.send(data=data_to_send, dest_rank = client.rank)
-            # print(f"Server sending data to client {client.rank}: {data_to_send}")  # 添加调试信息
-            print(f"Server broadcast to client {client.rank} succeed")
-            # dest_ranks.add(client.rank)
+            client.state_dict = slice_model(self.model, client.width, self.device, **self.model_kwargs).state_dict()
+
+        self.personalized_broadcast(
+            common_data={'status': 'TRAINING'},
+            # personalized_attr=['state_dict', 'is_straggler', 'tau'],
+            personalized_attr=['state_dict', 'is_straggler'],
+        )
+
         if self.verb:
             dest_ranks = self.selected_clients_idxes
             self.log(f'Server broadcast to {dest_ranks} succeed')
@@ -218,21 +219,18 @@ class ProxServer(Server):
     def multi_width_aggregate(self, clients=None):
         """使用新的环形聚合策略"""
         
-        # 准备聚合参数
-        client_widths = [c.width for c in clients]
-        global_model_copy = copy.deepcopy(self.model)
-        
         # 执行新聚合
         self.model = model_aggregation(
             clients=clients,
-            client_widths_input=client_widths,
-            global_model=global_model_copy
+            client_widths_input=self.widths,
+            global_model=self.model
         )
-        
 
-        # 保持原有逻辑：保存参数供聚类使用
-        for client in self.selected_clients:
-            client.last_params = copy.deepcopy(client.params)
+    def evaluate(self):
+        for width in self.widths:
+            test_model = slice_model(self.model, width, self.device, self.model_type, self.dataset_type)
+            test_dic = self.test(test_model, self.test_loader)
+            self.log(f'width:{width}=====test acc: {test_dic["test_acc"]}, test_loss: {test_dic["test_loss"]}')
 
     def run(self):
         """
@@ -252,33 +250,23 @@ class ProxServer(Server):
             print(f"Current global round: {self.global_round}.")
             self.get_and_set_stragglers()
 
-            for client in self.selected_clients:
-                client.state_dict = slice_model(self.model, client.width, self.device, **self.model_kwargs).state_dict()
+            # self.cluster_clients(self.selected_clients)
+            # self.dynamic_tau_adjustment(self.selected_clients)
 
-            self.personalized_broadcast(
-                common_data={'status': 'TRAINING'},
-                personalized_attr=['state_dict', 'is_straggler'],
-            )
+            print("Start broadcasting...")
+            self.multi_width_broadcast()
+            print("End broadcasting.")
 
             print("Start calling listen()...")
             self.listen()
             print("End calling listen().")
 
             print("Start aggregating...")
-            # self.multi_width_aggregate(clients=self.selected_clients)
-            self.model = model_aggregation(
-                self.selected_clients,
-                self.widths,
-                self.model
-            )
+            self.multi_width_aggregate(clients=self.selected_clients)
             print("End aggregating.")
             
             print("Start evaluating...")
-            # self.test(self.model, self.test_loader)
-            for width in self.widths:
-                test_model = slice_model(self.model, width, self.device, self.model_type, self.dataset_type)
-                test_dic = self.test(test_model, self.test_loader)
-                self.log(f'width:{width}=====test acc: {test_dic["test_acc"]}, test_loss: {test_dic["test_loss"]}')
+            self.evaluate()
             print("End evaluating.")
 
             self.average_client_info(self.selected_clients_idxes)
