@@ -129,10 +129,10 @@ class FedProxClient(Client):
         else:
             train_time = time.time() - s_t
 
-        # tcp = train_time
+        tcp = train_time
 
-        # return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time, 'tcp': tcp}
-        return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time}
+        return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time, 'tcp': tcp}
+        # return {'train_loss': epoch_loss/num_samples, 'train_samples': num_samples, 'train_time': train_time}
 
 
     def run(self):
@@ -142,7 +142,7 @@ class FedProxClient(Client):
         data = self.listen()
         self.width = data['width']       
         self.state_dict = data['state_dict']
-        # self.tau = data['tau']
+        self.tau = 50
         self.model = create_model_instance(self.model_type, self.dataset_type, self.width).to(self.device)
         self.model.load_state_dict(self.state_dict)
         self.loss_func = torch.nn.CrossEntropyLoss() if self.dataset_type in ['mnist', 'cifar10'] else torch.nn.BCEWithLogitsLoss()
@@ -156,14 +156,15 @@ class FedProxClient(Client):
         while True:
             data = self.listen()
             # print(data.keys())
+            self.tau = data['tau']
             if data['status'] == 'STOP':
                 if self.verb: self.log('Stopped by server')
                 break
             elif data['status'] == 'TRAINING':
                 self.model.load_state_dict(data['state_dict'])
                 trained_info = self.train_iters(
-                    # self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.tau
-                    self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iteration
+                    self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.tau
+                    # self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iteration
                     )
                 tested_info = self.test(
                     self.model, self.test_loader, self.loss_func, self.device)

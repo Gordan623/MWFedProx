@@ -31,6 +31,7 @@ def create_model_instance(model_name, dataset_name, width=1.0):
 class AlexNet(nn.Module):
     def __init__(self, num_classes: int = 10, dropout: float = 0.5, width: float = 1.0) -> None:
         super().__init__()
+        self.width = width  # 增加self.width属性防止'AlexNet' object has no attribute 'width'
         def adjust_channels(channels: int) -> int:
             return max(1, int(channels * width))
         self.features = nn.Sequential(

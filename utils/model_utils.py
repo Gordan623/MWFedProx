@@ -14,6 +14,9 @@ from .custom_models import create_model_instance
 
 @torch.no_grad()
 def add_model_inplace(param_to_add, target_param):
+    """
+    把较小的模型的param_to_add加到较大的模型的target_param上
+    """
     if param_to_add.shape == target_param.shape:
         target_param += param_to_add
     else:
@@ -163,6 +166,19 @@ def slice_model(model, width, device, model_type, dataset_type):
         param.data.zero_() # 初始化为0
         if name in model.state_dict():
             add_model_inplace_reverse(model.state_dict()[name], param)
+    return reference
+
+
+@torch.no_grad()
+def expand_model(model, width, device, model_type, dataset_type):
+    """
+    从小model中扩展得到大model
+    """
+    reference = create_model_instance(model_type, dataset_type, width).to(device)
+    for name, param in reference.named_parameters():
+        param.data.zero_()
+        if name in model.state_dict():
+            add_model_inplace(model.state_dict()[name], param)
     return reference
 
 
