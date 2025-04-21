@@ -182,6 +182,17 @@ def expand_model(model, width, device, model_type, dataset_type):
     return reference
 
 
+@torch.no_grad()
+def calculate_model_size(model):
+    """
+    计算模型的大小 (字节)
+    """
+    total_size = 0
+    for param in model.parameters():
+        total_size += sys.getsizeof(param.storage())/(1024*1024/8)  # 转换为 MB
+    return total_size
+
+
 if __name__ == '__main__':
     # --- 示例用法 ---
     class MockClient:

@@ -7,12 +7,6 @@ WORLD = MPI.COMM_WORLD
 rank = WORLD.Get_rank()
 size = WORLD.Get_size()
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4)
-# 应对显卡分配问题：CUDA out of memory
-# if rank < 28:
-#     os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4 + 4)
-# else:
-#     os.environ['CUDA_VISIBLE_DEVICES'] = str((rank-28) % 2 + 2 + 4)
 os.environ['CUDA_VISIBLE_DEVICES'] = str(rank % 4 + 4)
 
 import sys
@@ -157,11 +151,23 @@ class FedProxClient(Client):
             data = self.listen()
             # print(data.keys())
             self.tau = data['tau']
+            self.width = data['width']
             if data['status'] == 'STOP':
                 if self.verb: self.log('Stopped by server')
                 break
             elif data['status'] == 'TRAINING':
+                # self.model.load_state_dict(data['state_dict'])  # 直接load会出现shape dismatch, 因为传入了新的width
+
+                # 1. 先根据新传入的width重构模型
+                self.model = create_model_instance(self.model_type, self.dataset_type, self.width).to(self.device)
+
+                # 2. 重构optimizer&scheduler保证参数指向新的model
+                self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4)
+                self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.993)
+
+                # 3. 重新加载模型参数
                 self.model.load_state_dict(data['state_dict'])
+
                 trained_info = self.train_iters(
                     self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.tau
                     # self.model, self.train_loader, self.loss_func, self.optimizer, iters=self.local_iteration
@@ -170,12 +176,18 @@ class FedProxClient(Client):
                     self.model, self.test_loader, self.loss_func, self.device)
                 # Construct data to send
                 data_to_send = merge_several_dicts([trained_info, tested_info])
+                if self.USE_SIM_SYSHET:
+                    # send time usually larger than computation time
+                    data_to_send['send_time'] = self.rand_send()
                 self.log(f"send data: {data_to_send}")
                 data_to_send['state_dict'] = self.model.state_dict()
                 self.send(data_to_send)
             else:
                 raise Exception('Unknown status')
-            
+            self.lr *= 0.993
+            self.lr = self.lr if self.lr >= 1e-3 else 1e-3
+
+
             self.finalize_round()
             if self.global_round >= self.max_epochs:
                 if self.verb: self.log(f'Reaching epochs limit {self.max_epochs}')

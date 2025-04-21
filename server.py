@@ -1,6 +1,6 @@
 # All os.environ['CUDA_VISIBLE_DEVICES'] are set at the beginning
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # server所处的gpu显存剩余越多会对提升server运行速率有好处
 
 import sys
 sys.path.append(".")
@@ -31,16 +31,21 @@ class ProxClientInfo(ClientInfo):
         self.datasize = 1
         self.model = None
         self.tau = None  # 本地迭代次数
-        self.tcp = None  # 本地计算时间
-        self.tcm = None
+        self.tcp = 0.0  # 本地计算时间
+        self.tcm = 0.0
 
 class ProxServer(Server):
     def init(self):
-        self.model_dict = {}
+        self.model_size = []
+        for width in self.widths:
+            model = create_model_instance(self.model_type, self.dataset_type, width)
+            model_size = calculate_model_size(model)
+            self.model_size.append(model_size)
         self.model_kwargs = {
             'model_type': self.model_type,
             'dataset_type': self.dataset_type
         }
+        self.model_dict = {}
         self.widths = sorted(self.args.widths)  # 支持的模型宽度
         print(self.widths)
         self.model = create_model_instance(self.model_type, self.dataset_type, 1.0).to(self.device)  # 创建全局模型实例 
@@ -156,7 +161,7 @@ class ProxServer(Server):
             model_type: server模型类型
             dataset_type: server数据集类型
         """
-        # 初始化聚类中心
+        # 一、初始化聚类中心
         if not any(self.cluster_centers):
             count = 0
             for client in clients:
@@ -171,101 +176,100 @@ class ProxServer(Server):
         client_models = [self.create_model_and_load(client, model_type, dataset_type) for client in clients]
 
         print("Start clustering clients...")
-        # 迭代聚类
+        # 二、迭代聚类
         for iter in range(self.max_cluster_iter):
             # 1. 初始化距离矩阵
             distance_matrix = torch.zeros((len(clients), self.cluster_num))
-
+            slice_time = 0.0
+            cosine_time = 0.0
+            start_time = time.time()
             # 2. 计算每个客户端与每个聚类中心的余弦相似度并更新距离矩阵
             for i, client_model in enumerate(client_models):
                 current_client = clients[i]  # 获取当前客户端对象
                 current_width = current_client.width  # 明确获取当前客户端宽度
                 for j in range(self.cluster_num):
+                    # 将聚类中心切片到当前设备宽度
                     centroid_model = slice_model(self.cluster_centers[j], current_width, self.device, **self.model_kwargs)
+                    slice_time += time.time() - start_time
+                    start_time = time.time()
                     # print(f"client_model: {client_model}\ncentroid_model: {centroid_model}")
                     distance_matrix[i][j] = torch.cosine_similarity(  # distance_matrix[i][j]表示第i个客户端与第j个聚簇中心的余弦相似度
                         self.flatten_paras(client_model.parameters()),
                         self.flatten_paras(centroid_model.parameters()),
                         dim=0
                     )
-            print(distance_matrix)
+                    cosine_time += time.time() - start_time
+            print(f"For iter {iter+1}, slice_time: {slice_time:.4f}, cosine_time: {cosine_time:.4f}")
+
             # 3. 分配设备到聚类
-            cluster_assignments = torch.argmax(distance_matrix, dim=1)  # 每个客户端分配到的聚类
+            cluster_assignments = defaultdict(list)
+            for i in range(len(clients)):  # i表示客户端索引rank
+                sorted_clusters = torch.argsort(distance_matrix[i], descending=True)
+                assigned = False
+                for cluster_idx in sorted_clusters:
+                    if len(cluster_assignments[cluster_idx.item()]) < len(self.widths):
+                        cluster_assignments[cluster_idx.item()].append(i)
+                        assigned = True
+                        break
+                if not assigned:  # Fallback
+                    cluster_assignments[sorted_clusters[0].item()].append(i)
 
             # 4. 更新聚类中心
             new_centers = []
             for j in range(self.cluster_num):
-                # 获取该簇的客户端索引
-                cluster_indices = np.where(cluster_assignments == j)[0]
-                if len(cluster_indices) == 0:
+                cluster_indices = cluster_assignments[j]
+                if not cluster_indices:
                     new_centers.append(self.cluster_centers[j])
                     continue
-                    
-                # 聚合模型（需要处理state_dict）
-                aggregated = create_model_instance(model_type, dataset_type, 1.0).to(self.device)
                 
-                # 加权聚合逻辑
-                total_weight = sum(clients[i].datasize for i in cluster_indices)
-                for param in aggregated.parameters():
-                    param.data.zero_()
+                # # 收集模型、宽度、tau
+                # models = [self.create_model_and_load(clients[i], model_type, dataset_type) for i in cluster_indices]
+                # widths = [clients[i].width for i in cluster_indices]
+                # taus = [self.tau[clients[i].rank] for i in cluster_indices]
+
+                # 拿到这一簇的 ProxClientInfo 对象列表
+                clustered_clients = [clients[i] for i in cluster_indices]
+                # 对应的宽度列表
+                clustered_widths = [c.width for c in clustered_clients]
+
+                # 调用FedSNN风格的聚合函数
+                # aggregated = model_aggregation(models, widths, taus, model_type, self.model_size)
+                aggregated = model_aggregation(
+                    clients=clustered_clients,
+                    client_widths_input=[0,0] + self.widths,
+                    global_model=self.cluster_centers[j],
+                    device=self.device)
                 
-                for i in cluster_indices:
-                    client = clients[i]
-                    weight = client.datasize / total_weight
-                    # 必须从state_dict创建模型实例
-                    client_model = self.create_model_and_load(client, model_type, dataset_type)
-                    # 统一宽度后聚合
-                    full_model = expand_model(client_model, 1.0, self.device, **self.model_kwargs)
-                    for agg_param, cli_param in zip(aggregated.parameters(), full_model.parameters()):
-                        agg_param.data += cli_param.data * weight
-                        
                 new_centers.append(aggregated)
-            
             self.cluster_centers = new_centers
-            print(f"iter {iter+1}(from 1 to 10) ends.")
-        # print(f"Cluster centers = {self.cluster_centers}")
-
-
-
-    def dynamic_tau_adjustment(self, clients):
-        """动态 tau 调整策略，跳过缺失统计的客户端"""
-        # 1. 计算最后三轮的平均值, 使用nanmean并允许 NaN 产生
-        tcp = {}
-        tcm = {}
-        for c in clients:
-            # 取最后 3 条记录，允许产生空切片
-            last_tcp = self.tcp_history[c.rank][-3:]
-            last_tcm = self.tcm_history[c.rank][-3:]
-            # np.nanmean会忽略NaN, 但全空时仍返回NaN并警告: contentReference[oaicite:1]{index=1}
-            tcp[c.rank] = np.nanmean(last_tcp)
-            tcm[c.rank] = np.nanmean(last_tcm)
-
-        # 2. 计算max_time, 只考虑有有效值的客户端
-        valid_clients = [c for c in clients if not (np.isnan(tcp[c.rank]) or np.isnan(tcm[c.rank]))]
-        if not valid_clients:
-            # 如果一个也没有有效数据, 则直接返回, 不做任何调整
-            return
-
-        max_time = max(
-            tcm[c.rank] + (10 / self.tau[c.rank]) * tcp[c.rank]
-            for c in valid_clients
-        )
-
-        # 3. 对每个客户端进行tau调整, 忽略无效者
-        for c in clients:
-            if np.isnan(tcp[c.rank]) or np.isnan(tcm[c.rank]) or tcp[c.rank] == 0:
-                # 跳过没有统计数据或tcp为 0 的客户端
+        
+        # 三、宽度分配&tau更新
+        for cluster_id, cluster_indices in cluster_assignments.items():
+            if not cluster_indices:
                 continue
+            # 1. 计算每个client的时间成本
+            max_time, selected_client = 0, None
+            for idx in cluster_indices:
+                client = clients[idx]
+                current_width_idx = self.widths.index(client.width)
+                # 计算时间成本
+                time_cost = client.tcm * (self.model_size[-1]/self.model_size[current_width_idx]) + \
+                    (10/self.tau[client.rank]) * client.tcp * (self.model_size[-1]/self.model_size[current_width_idx])/2
+                if time_cost > max_time:
+                    max_time = time_cost
+                    selected_client = client
 
-            # 公式: new_tau = (max_time - tcm) * old_tau / (tcp/2)
-            ratio = (max_time - tcm[c.rank]) * self.tau[c.rank] / (tcp[c.rank] / 2)
-            # 确保ratio为实数且不为NaN
-            if np.isfinite(ratio):
-                # 取整并裁剪到合理区间
-                self.tau[c.rank] = int(np.clip(ratio, 50, 200))
-                c.tau = self.tau[c.rank]
+            # 2. 宽度分配&tau更新
+            if selected_client:
+                target_width = self.widths[cluster_id % len(self.widths)]
+                selected_client.width = target_width
+                # 计算new_tau
+                new_width_idx = self.widths.index(target_width)
+                new_tau = int((max_time - selected_client.tcm) * self.tau[selected_client.rank] / (selected_client.tcp * (self.model_size[new_width_idx]/self.model_size[current_width_idx])/2))
+                new_tau = int(np.clip(new_tau, 50, 200))  # 裁剪到合理范围
+                self.tau[selected_client.rank] = new_tau
 
-
+        # return cluster_assignments
 
     def multi_width_broadcast(self):
         """
@@ -276,7 +280,7 @@ class ProxServer(Server):
 
         self.personalized_broadcast(
             common_data={'status': 'TRAINING'},
-            personalized_attr=['state_dict', 'is_straggler', 'tau'],
+            personalized_attr=['state_dict', 'width', 'is_straggler', 'tau'],
             # personalized_attr=['state_dict', 'is_straggler'],
         )
 
@@ -307,7 +311,15 @@ class ProxServer(Server):
         and wait for next round
         """
         self.init_clients(clientObj=ProxClientInfo)
-        self.assign_widths()
+        # self.assign_widths()
+
+        # 初始化随机分配宽度
+        for i in range(1, self.num_clients+1):
+            client = self.get_client_by_rank(i)
+            client.width = self.widths[i % len(self.widths)]
+            client.state_dict = self.model_dict[client.width].state_dict()
+            self.log(f'client {i} width: {client.width}')
+
         self.generate_global_test_set()
         self.select_clients()
         print("INIT ROUND")
@@ -321,7 +333,6 @@ class ProxServer(Server):
 
             # if self.global_round > 0:
             self.cluster_clients(self.selected_clients, self.model_type, self.dataset_type)
-            self.dynamic_tau_adjustment(self.selected_clients)
 
             print("Start broadcasting...")
             self.multi_width_broadcast()
