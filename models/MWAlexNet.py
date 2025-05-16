@@ -142,6 +142,7 @@ class NaNCheckModule(nn.Module):
 class AlexNet(nn.Module):
     def __init__(self, num_classes: int = 10, dropout: float = 0.5, width: float = 1.0) -> None:
         super().__init__()
+        self.width = width
         def adjust_channels(channels: int) -> int:
             return max(1, int(channels * width))
         self.features = nn.Sequential(

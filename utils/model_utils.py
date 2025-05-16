@@ -94,7 +94,7 @@ def get_ring(param, lower_bound, upper_bound):
 
 
 @torch.no_grad()
-def model_aggregation(clients, client_widths_input, global_model, device="cuda"):
+def model_aggregation(clients, client_widths_input, global_model, weighted=True, device="cuda"):
     """
     聚合不同宽度的客户端模型。
 
@@ -125,8 +125,11 @@ def model_aggregation(clients, client_widths_input, global_model, device="cuda")
                 get_ring(target, cur_min_width, sorted_widths[i+1])
             continue # 跳到下一个宽度边界
         # 计算权重
-        total_datasize = sum(client.datasize for client in available_clients)
-        client_weights = {client: client.datasize / total_datasize for client in available_clients}
+        if weighted:
+            total_datasize = sum(client.datasize for client in available_clients)
+            client_weights = {client: client.datasize / total_datasize for client in available_clients}
+        else:
+            client_weights = {client: 1/len(available_clients) for client in available_clients}
         # print(f"当前环 ({cur_min_width}, {sorted_widths[i+1]}) 的客户端权重: {client_weights}")
         # 获取当前环的累加器模型
         accumulator_model = ring_accumulators[i]
@@ -154,6 +157,7 @@ def model_aggregation(clients, client_widths_input, global_model, device="cuda")
                 add_model_inplace(ring_param, final_param)
 
     return final_model
+
 
 
 @torch.no_grad()

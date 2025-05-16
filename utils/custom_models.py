@@ -1,6 +1,10 @@
 from functools import partial
 from typing import Any, Optional
 
+import sys
+sys.path.append("..")
+from models.ResNet import ResNet9
+
 import torch
 import torch.nn as nn
 
@@ -18,6 +22,11 @@ def create_model_instance(model_name, dataset_name, width=1.0):
             model = AlexNet(num_classes=10, width=width)
         elif dataset_name == 'cifar100':
             model = AlexNet(num_classes=100, width=width)
+    elif model_name == 'resnet':
+        if dataset_name == 'cifar10':
+            model = ResNet9(do_batchnorm=True, num_classes=10, width=width)
+        elif dataset_name == 'cifar100':
+            model = ResNet9(pretrained = False, num_classes=100, width=width)
     elif model_name == 'cnn':
         if dataset_name == 'har':
             model = CNNHAR(width=width)
@@ -74,6 +83,8 @@ class AlexNet(nn.Module):
         x = self.classifier(x)
         # return F.log_softmax(x, dim=1)
         return x
+
+
 
 class CNNHAR(nn.Module):
     def __init__(self, num_classes: int = 6, width: float = 1.0) -> None:

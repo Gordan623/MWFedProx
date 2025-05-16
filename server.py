@@ -14,6 +14,7 @@ sys.path.append(os.path.join(current_dir, "..", "utils"))
 
 import copy
 # Now import FLamingo
+from utils.custom_models import create_model_instance
 from FLamingo.core.server import *
 from torchvision import transforms
 from torchvision.datasets import MNIST, CIFAR10, EMNIST
@@ -21,7 +22,6 @@ from torch.utils.data import DataLoader
 # from algorithms import broadcast, aggregate
 from collections import defaultdict
 from utils.model_utils import *
-from utils.custom_models import create_model_instance
 
 class ProxClientInfo(ClientInfo):
     def __init__(self, rank):
@@ -33,14 +33,19 @@ class ProxClientInfo(ClientInfo):
         self.tau = None  # 本地迭代次数
         self.tcp = 0.0  # 本地计算时间
         self.tcm = 0.0
+        self.acc_before_train = 0.0
+        self.loss_before_train = 0.0
+        self.acc_after_train = 0.0
+        self.loss_after_train = 0.0
+        self.local_iters = 50  # 本地迭代次数
 
 class ProxServer(Server):
     def init(self):
-        self.model_size = []
-        for width in self.widths:
-            model = create_model_instance(self.model_type, self.dataset_type, width)
-            model_size = calculate_model_size(model)
-            self.model_size.append(model_size)
+        # self.model_size = []
+        # for width in self.widths:
+        #     model = create_model_instance(self.model_type, self.dataset_type, width)
+        #     model_size = calculate_model_size(model)
+        #     self.model_size.append(model_size)
         self.model_kwargs = {
             'model_type': self.model_type,
             'dataset_type': self.dataset_type
@@ -48,10 +53,13 @@ class ProxServer(Server):
         self.model_dict = {}
         self.widths = sorted(self.args.widths)  # 支持的模型宽度
         print(self.widths)
+        self.num_params = {}
         self.model = create_model_instance(self.model_type, self.dataset_type, 1.0).to(self.device)  # 创建全局模型实例 
         for width in self.widths:
             cur_model = slice_model(self.model, width, self.device, **self.model_kwargs)
             self.model_dict[width] = cur_model
+            # self.print_model_info(cur_model)
+            self.num_params[width] = sum(p.numel() for p in cur_model.parameters())
         self.model.to(self.device)
         self.network = NetworkHandler()
         self.loss_func = nn.CrossEntropyLoss() if self.dataset_type in ['mnist', 'cifar10'] else nn.BCEWithLogitsLoss()
@@ -61,7 +69,7 @@ class ProxServer(Server):
         self.cluster_num = int(self.num_clients / len(self.widths))
         self.cluster_centers = [None] * self.cluster_num
         self.max_cluster_iter = self.args.max_cluster_iter
-        self.tau = {rank: self.args.local_iteration for rank in range(1, self.num_clients+1)}  # 保存客户端tau值
+        self.tau = {rank: self.args.local_iters for rank in range(1, self.num_clients+1)}  # 保存客户端tau值
         self.tcp_history = defaultdict(list)  # 保存客户端计算时间
         self.tcm_history = defaultdict(list)  # 保存客户端通信时间
 
@@ -82,9 +90,9 @@ class ProxServer(Server):
         for rank in self.non_stragglers_idxes:
             self.get_client_by_rank(rank).is_straggler = False
             self.get_client_by_rank(rank).local_epochs = self.local_epochs
-        self.log(f"stragglers: {self.stragglers_num}")
-        self.log(f"stragglers_idxes: {self.stragglers_idxes}")
-        self.log(f"non_stragglers_idxes: {self.non_stragglers_idxes}")
+        # self.log(f"stragglers: {self.stragglers_num}")
+        # self.log(f"stragglers_idxes: {self.stragglers_idxes}")
+        # self.log(f"non_stragglers_idxes: {self.non_stragglers_idxes}")
         return self.stragglers_idxes, self.non_stragglers_idxes
     
     # 根据策略为客户端分配宽度
@@ -139,20 +147,7 @@ class ProxServer(Server):
         model.load_state_dict(client.state_dict)
         return model
 
-    def flatten_paras(self, params):
-        """
-        将模型的参数展平为一维向量
-        Args:
-            params: 模型的参数列表
-        Returns:
-            flatten_params: 展平后的参数向量
-        """
-        flatten_params = []
-        for p in params:
-            flatten_params.append(torch.reshape(p.data.clone().detach(), [-1]))
-        return torch.cat(flatten_params)
-
-    def cluster_clients(self, clients, model_type, dataset_type):
+    def cluster_clients(self):
         """
         Cluster clients based on their data size.
         算法流程:
@@ -161,115 +156,169 @@ class ProxServer(Server):
             model_type: server模型类型
             dataset_type: server数据集类型
         """
-        # 一、初始化聚类中心
-        if not any(self.cluster_centers):
-            count = 0
-            for client in clients:
-                if client.width == 1.0:
-                    temp_model = self.create_model_and_load(client, model_type, dataset_type)
-                    self.cluster_centers[count] = copy.deepcopy(temp_model)
-                    count += 1
-                    if count == self.cluster_num:
-                        break
+        cluster_centers = []
+        max_clusters = self.num_clients // len(self.widths)
+        for client in self.all_clients:
+            if client.width == 1.0:
+                center_model = create_model_instance(self.model_type,
+                                                        self.dataset_type,
+                                                        width=1.0).to(self.device)
+                center_model.load_state_dict(client.state_dict)
+                cluster_centers.append(center_model)
+                if len(cluster_centers) >= max_clusters:
+                    break
         
-        # 创建每个ClientInfo对应的model
-        client_models = [self.create_model_and_load(client, model_type, dataset_type) for client in clients]
+        self.num_clusters = len(cluster_centers)
+        self.max_iterations = self.args.max_cluster_iter
+        assignments = [-1] * self.num_clients
+        converged = False
+        iteration = 0
 
-        print("Start clustering clients...")
-        # 二、迭代聚类
-        for iter in range(self.max_cluster_iter):
-            # 1. 初始化距离矩阵
-            distance_matrix = torch.zeros((len(clients), self.cluster_num))
-            slice_time = 0.0
-            cosine_time = 0.0
-            start_time = time.time()
-            # 2. 计算每个客户端与每个聚类中心的余弦相似度并更新距离矩阵
-            for i, client_model in enumerate(client_models):
-                current_client = clients[i]  # 获取当前客户端对象
-                current_width = current_client.width  # 明确获取当前客户端宽度
-                for j in range(self.cluster_num):
-                    # 将聚类中心切片到当前设备宽度
-                    centroid_model = slice_model(self.cluster_centers[j], current_width, self.device, **self.model_kwargs)
-                    slice_time += time.time() - start_time
-                    start_time = time.time()
-                    # print(f"client_model: {client_model}\ncentroid_model: {centroid_model}")
-                    distance_matrix[i][j] = torch.cosine_similarity(  # distance_matrix[i][j]表示第i个客户端与第j个聚簇中心的余弦相似度
-                        self.flatten_paras(client_model.parameters()),
-                        self.flatten_paras(centroid_model.parameters()),
-                        dim=0
-                    )
-                    cosine_time += time.time() - start_time
-            print(f"For iter {iter+1}, slice_time: {slice_time:.4f}, cosine_time: {cosine_time:.4f}")
+        self.log(f"Starting clustering with {self.num_clusters} clusters...")
 
-            # 3. 分配设备到聚类
-            cluster_assignments = defaultdict(list)
-            for i in range(len(clients)):  # i表示客户端索引rank
-                sorted_clusters = torch.argsort(distance_matrix[i], descending=True)
-                assigned = False
-                for cluster_idx in sorted_clusters:
-                    if len(cluster_assignments[cluster_idx.item()]) < len(self.widths):
-                        cluster_assignments[cluster_idx.item()].append(i)
-                        assigned = True
-                        break
-                if not assigned:  # Fallback
-                    cluster_assignments[sorted_clusters[0].item()].append(i)
+        while not converged and iteration < self.max_iterations:
+            self.log(f"Clustering iteration {iteration + 1}")
+            old_assignments = assignments[:]
 
-            # 4. 更新聚类中心
-            new_centers = []
-            for j in range(self.cluster_num):
-                cluster_indices = cluster_assignments[j]
-                if not cluster_indices:
-                    new_centers.append(self.cluster_centers[j])
+            # 计算相似度矩阵
+            similarity_matrix = torch.zeros(self.num_clusters, self.num_clients, device=self.device)
+            for c_idx, center_model in enumerate(cluster_centers):
+                for cli_idx, client in enumerate(self.all_clients):
+                    client_model = create_model_instance(self.model_type,
+                                                         self.dataset_type,
+                                                         width=client.width)
+                    client_model.load_state_dict(client.state_dict)
+                    # print(client_model)
+                    client_model = client_model.to(self.device)
+                    client_width = client.width
+                    client_params_flat = flatten_parameters(client_model)
+                    # 切片中心模型
+                    sliced_center_model = slice_model(center_model, client_width, self.device, **self.model_kwargs)
+                    sliced_center_params_flat = flatten_parameters(sliced_center_model)
+                    # 计算相似度
+                    similarity = torch.cosine_similarity(client_params_flat, sliced_center_params_flat, dim=0)
+                    similarity_matrix[c_idx, cli_idx] = similarity
+
+            # 2. 分配客户端 (两阶段)
+            assignments = [-1] * self.num_clients # 重置分配
+            unassigned_clients_indices = list(range(self.num_clients))
+            assigned_count_this_iter = [0] * self.num_clusters # 追踪本轮分配情况
+
+            # --- 第一阶段：优先分配给未满聚类 (Lines 6-9 in Alg 1, modified) ---
+            clients_assigned_in_priority = 0
+            temp_unassigned = [] # 存储第一阶段暂时无法分配的
+            for cli_idx in unassigned_clients_indices:
+                eligible_clusters = [] # 找到当前客户端可以分配的未满聚类
+                for c_idx in range(self.num_clusters):
+                    # 检查聚类是否未满 (基于本轮已分配的数量)
+                    if assigned_count_this_iter[c_idx] < len(self.widths):
+                        eligible_clusters.append(c_idx)
+
+                if not eligible_clusters:
+                    # 如果所有聚类都满了，该客户端暂时不分配，留给第二阶段
+                    temp_unassigned.append(cli_idx)
                     continue
-                
-                # # 收集模型、宽度、tau
-                # models = [self.create_model_and_load(clients[i], model_type, dataset_type) for i in cluster_indices]
-                # widths = [clients[i].width for i in cluster_indices]
-                # taus = [self.tau[clients[i].rank] for i in cluster_indices]
 
-                # 拿到这一簇的 ProxClientInfo 对象列表
-                clustered_clients = [clients[i] for i in cluster_indices]
-                # 对应的宽度列表
-                clustered_widths = [c.width for c in clustered_clients]
+                # 在未满的聚类中找到最相似的
+                best_cluster_idx = -1
+                max_similarity = -float('inf')
+                for c_idx in eligible_clusters:
+                    if similarity_matrix[c_idx, cli_idx] > max_similarity:
+                        max_similarity = similarity_matrix[c_idx, cli_idx]
+                        best_cluster_idx = c_idx
 
-                # 调用FedSNN风格的聚合函数
-                # aggregated = model_aggregation(models, widths, taus, model_type, self.model_size)
-                aggregated = model_aggregation(
-                    clients=clustered_clients,
-                    client_widths_input=[0,0] + self.widths,
-                    global_model=self.cluster_centers[j],
-                    device=self.device)
-                
-                new_centers.append(aggregated)
-            self.cluster_centers = new_centers
+                # if best_cluster_idx != -1:
+                assignments[cli_idx] = best_cluster_idx
+                assigned_count_this_iter[best_cluster_idx] += 1
+                clients_assigned_in_priority += 1
+                # else:
+                #     # 理论上如果 eligible_clusters 不为空，总能找到一个 best_cluster_idx
+                #     temp_unassigned.append(cli_idx) # 以防万一
+
+            self.log(f"  Priority assignment phase: Assigned {clients_assigned_in_priority} clients.")
+            unassigned_clients_indices = temp_unassigned # 更新未分配列表
+
+            # --- 第二阶段：分配剩余客户端给最近的聚类 (Lines 8-9 in Alg 1, standard assignment) ---
+            clients_assigned_in_second_phase = 0
+            if unassigned_clients_indices:
+                self.log(f"  Second phase assignment: Assigning {len(unassigned_clients_indices)} remaining clients.")
+                for cli_idx in unassigned_clients_indices:
+                    # 直接从所有聚类中找最相似的
+                    best_cluster_idx = torch.argmax(similarity_matrix[:, cli_idx]).item()
+                    assignments[cli_idx] = best_cluster_idx
+                    # 注意：这里不再检查聚类大小限制，允许超出
+                    assigned_count_this_iter[best_cluster_idx] += 1 # 继续追踪总分配数
+                    clients_assigned_in_second_phase += 1
+            self.log(f"  current {assignments}")
+            # 检查是否收敛
+            if assignments == old_assignments:
+                converged = True
+                self.log("Clustering converged.")
+            else:
+                # 3. 更新聚类中心 (Line 13 in Alg 1)
+                new_cluster_centers = []
+                for c_idx in range(self.num_clusters):
+                    assigned_clients_indices = [idx for idx, cluster_id in enumerate(assignments) if cluster_id == c_idx]
+                    if not assigned_clients_indices:
+                        self.log(f"Warning: Cluster {c_idx} became empty. Re-using old center.")
+                        new_cluster_centers.append(cluster_centers[c_idx])
+                        continue
+                    assigned_clients = [self.all_clients[cli_idx] for cli_idx in assigned_clients_indices]
+                    
+                    new_center = model_aggregation(assigned_clients, self.widths, 
+                                                   cluster_centers[c_idx], False, self.device)
+                    new_cluster_centers.append(new_center)
+                cluster_centers = new_cluster_centers
+            iteration += 1
         
-        # 三、宽度分配&tau更新
-        for cluster_id, cluster_indices in cluster_assignments.items():
-            if not cluster_indices:
-                continue
-            # 1. 计算每个client的时间成本
-            max_time, selected_client = 0, None
-            for idx in cluster_indices:
-                client = clients[idx]
-                current_width_idx = self.widths.index(client.width)
-                # 计算时间成本
-                time_cost = client.tcm * (self.model_size[-1]/self.model_size[current_width_idx]) + \
-                    (10/self.tau[client.rank]) * client.tcp * (self.model_size[-1]/self.model_size[current_width_idx])/2
-                if time_cost > max_time:
-                    max_time = time_cost
-                    selected_client = client
+        if not converged:   
+            self.log(f"Clustering did not converge after {self.max_iterations} iterations.")
 
-            # 2. 宽度分配&tau更新
-            if selected_client:
-                target_width = self.widths[cluster_id % len(self.widths)]
-                selected_client.width = target_width
-                # 计算new_tau
-                new_width_idx = self.widths.index(target_width)
-                new_tau = int((max_time - selected_client.tcm) * self.tau[selected_client.rank] / (selected_client.tcp * (self.model_size[new_width_idx]/self.model_size[current_width_idx])/2))
-                new_tau = int(np.clip(new_tau, 50, 200))  # 裁剪到合理范围
-                self.tau[selected_client.rank] = new_tau
+        # 构建最终聚类结果
+        final_clusters = [[] for _ in range(self.num_clusters)]
+        for cli_idx, cluster_id in enumerate(assignments):
+            if cluster_id != -1:
+                final_clusters[cluster_id].append(self.all_clients[cli_idx])
 
-        # return cluster_assignments
+        return final_clusters
+    
+    def estimate_time(self, client, iters=30):
+        # 已知每个客户端的computation和communication，估计客户端的用时
+        ratio = client.num_params / self.num_params[1.0]
+        return client.tcp * ratio * iters + client.tcm * 2 * ratio
+    
+    def FedSNN(self):
+        cluster_results = self.cluster_clients()
+        # 每个聚类内部分配 width
+        for cluster in cluster_results:
+            # 根据设备能力排序
+            print(f"cur cluster {cluster}")
+            cluster.sort(key=lambda x: x.tcm+x.tcp)
+            # 从最慢的开始设置最小的宽度
+            for i, width in enumerate(self.widths):
+                cluster[i].width = width
+                cluster[i].num_params = self.num_params[cluster[i].width]
+                print(cluster[i].rank, cluster[i].width)
+            if len(cluster) > len(self.widths):
+                # 多出来的随机分配宽度
+                print("additional")
+                for j in range(len(self.widths), len(cluster)):
+                    cluster[j].width = random.choice(self.widths)
+                    cluster[j].num_params = self.num_params[cluster[j].width]
+                    print(cluster[j].rank, cluster[j].width)
+        # 估计所有客户端中用时最长的那个
+        if self.use_adp_localiter:
+            max_time = 0.0
+            for client in self.all_clients:
+                time = self.estimate_time(client)
+                if time > max_time:
+                    max_time = time
+                # print(f"max_time: {max_time}')")
+            for client in self.all_clients:
+                ratio = client.num_params / self.num_params[client.width]
+                est_cp_time = max_time - client.tcm * 2 * ratio
+                client.local_iters = int(est_cp_time / (client.tcp * ratio))
+                client.local_iters = max(min(client.local_iters, self.clip_iter['max']), self.clip_iter['min'])
 
     def multi_width_broadcast(self):
         """
@@ -280,7 +329,7 @@ class ProxServer(Server):
 
         self.personalized_broadcast(
             common_data={'status': 'TRAINING'},
-            personalized_attr=['state_dict', 'width', 'is_straggler', 'tau'],
+            personalized_attr=['state_dict', 'width',  'local_iters', 'tcp', 'tcm'],
             # personalized_attr=['state_dict', 'is_straggler'],
         )
 
@@ -318,21 +367,26 @@ class ProxServer(Server):
             client = self.get_client_by_rank(i)
             client.width = self.widths[i % len(self.widths)]
             client.state_dict = self.model_dict[client.width].state_dict()
+            client.num_params = self.num_params[client.width]
+            client.local_iters = self.local_iters
+            # tcp, tcm
+            client.tcp = self.sys_het_list[(i-1) % len(self.sys_het_list)]['computation']/10
+            client.tcm = self.sys_het_list[(i-1) % len(self.sys_het_list)]['communication']
             self.log(f'client {i} width: {client.width}')
 
         self.generate_global_test_set()
         self.select_clients()
-        print("INIT ROUND")
-        self.personalized_broadcast(
-            common_data={'status': 'INIT'},
-            personalized_attr=['state_dict', 'width', 'tau']
-        )
+        # print("INIT ROUND")
+        # self.personalized_broadcast(
+        #     common_data={'status': 'INIT'},
+        #     personalized_attr=['state_dict', 'width', 'tau']
+        # )
         while True:
             print(f"Current global round: {self.global_round}.")
-            self.get_and_set_stragglers()
+            # self.get_and_set_stragglers()
 
-            # if self.global_round > 0:
-            self.cluster_clients(self.selected_clients, self.model_type, self.dataset_type)
+            if self.USE_CLUSTER:
+                self.FedSNN()
 
             print("Start broadcasting...")
             self.multi_width_broadcast()
@@ -361,6 +415,12 @@ class ProxServer(Server):
         self.log("Yes, just end your job")
         self.stop_all()
 
+
+def flatten_parameters(model):
+    params = []
+    for param in model.parameters():
+        params.append(param.view(-1))
+    return torch.cat(params)
 
 if __name__ == "__main__":
     server = ProxServer()

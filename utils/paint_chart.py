@@ -117,12 +117,12 @@ def plot_training_curves(df):
     output_dir = "../charts"  # 在MWFedProx/utils下运行
     # output_dir = "./charts"  # 在MWFedProx/下运行
     os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "chart.png")
+    output_file = os.path.join(output_dir, "RandSNN_clustered_noniid_het.png")
     plt.savefig(output_file)
     plt.show()
 
 # 解析日志
-df = parse_log("../runs/cifar10/2025-04-12-four-widths/server.log")  # 在MWFedProx/utils下运行
+df = parse_log("../runs/cifar10/RandSNN_clustered_noniid_het/server.log")  # 在MWFedProx/utils下运行
 # df = parse_log("./runs/cifar10/2025-04-12-four-widths/server.log")  # 在MWFedProx/下运行
 
 # 绘图

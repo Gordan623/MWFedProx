@@ -1,16 +1,15 @@
-import math
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 import itertools
-
 
 class Mul(nn.Module):
     def __init__(self, weight):
         super().__init__()
         self.weight = weight
     def __call__(self, x):
-        return x*self.weight
+        return x * self.weight
+
 
 def batch_norm(num_channels, bn_bias_init=None, bn_bias_freeze=False,
                bn_weight_init=None, bn_weight_freeze=False):
@@ -26,6 +25,7 @@ def batch_norm(num_channels, bn_bias_init=None, bn_bias_freeze=False,
 
     return m
 
+
 class ConvBN(nn.Module):
     def __init__(self, do_batchnorm, c_in, c_out, bn_weight_init=1.0, pool=None, **kw):
         super().__init__()
@@ -38,10 +38,10 @@ class ConvBN(nn.Module):
         self.relu = nn.ReLU(True)
 
     def forward(self, x):
+        out = self.conv(x)
         if self.do_batchnorm:
-            out = self.relu(self.bn(self.conv(x)))
-        else:
-            out = self.relu(self.conv(x))
+            out = self.bn(out)
+        out = self.relu(out)
         if self.pool:
             out = self.pool(out)
         return out
@@ -54,6 +54,7 @@ class ConvBN(nn.Module):
             for p in l.parameters():
                 p.requires_grad = True
         return itertools.chain.from_iterable([l.parameters() for l in layers])
+
 
 class Residual(nn.Module):
     def __init__(self, do_batchnorm, c, **kw):
@@ -68,21 +69,20 @@ class Residual(nn.Module):
         layers = [self.res1, self.res2]
         return itertools.chain.from_iterable([l.prep_finetune(iid, c, c, **kw) for l in layers])
 
+
 class BasicNet(nn.Module):
-    def __init__(self, do_batchnorm, channels, weight,  pool, num_classes, initial_channels=3, new_num_classes=None, **kw):
+    def __init__(self, do_batchnorm, channels, weight, pool, num_classes,
+                 initial_channels=3, new_num_classes=None, **kw):
         super().__init__()
         self.new_num_classes = new_num_classes
         self.prep = ConvBN(do_batchnorm, initial_channels, channels['prep'], **kw)
 
-        self.layer1 = ConvBN(do_batchnorm, channels['prep'], channels['layer1'],
-                             pool=pool, **kw)
+        self.layer1 = ConvBN(do_batchnorm, channels['prep'], channels['layer1'], pool=pool, **kw)
         self.res1 = Residual(do_batchnorm, channels['layer1'], **kw)
 
-        self.layer2 = ConvBN(do_batchnorm, channels['layer1'], channels['layer2'],
-                             pool=pool, **kw)
+        self.layer2 = ConvBN(do_batchnorm, channels['layer1'], channels['layer2'], pool=pool, **kw)
 
-        self.layer3 = ConvBN(do_batchnorm, channels['layer2'], channels['layer3'],
-                             pool=pool, **kw)
+        self.layer3 = ConvBN(do_batchnorm, channels['layer2'], channels['layer3'], pool=pool, **kw)
         self.res3 = Residual(do_batchnorm, channels['layer3'], **kw)
 
         self.pool = nn.MaxPool2d(4)
@@ -97,10 +97,10 @@ class BasicNet(nn.Module):
         out = self.layer2(out)
         out = self.res3(self.layer3(out))
 
-        out = self.pool(out).view(out.size()[0], -1)
+        out = self.pool(out).view(out.size(0), -1)
         out = self.classifier(self.linear(out))
         return F.log_softmax(out, dim=1)
-    
+
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -116,7 +116,6 @@ class BasicNet(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def finetune_parameters(self, iid, channels, weight, pool, **kw):
-        #layers = [self.prep, self.layer1, self.res1, self.layer2, self.layer3, self.res3]
         self.linear = nn.Linear(channels['layer3'], self.new_num_classes, bias=False)
         self.classifier = Mul(weight)
         modules = [self.linear, self.classifier]
@@ -124,30 +123,19 @@ class BasicNet(nn.Module):
             for p in m.parameters():
                 p.requires_grad = True
         return itertools.chain.from_iterable([m.parameters() for m in modules])
-        """
-        prep = self.prep.prep_finetune(iid, 3, channels['prep'], **kw)
-        layer1 = self.layer1.prep_finetune(iid, channels['prep'], channels['layer1'],
-                             pool=pool, **kw)
-        res1 = self.res1.prep_finetune(iid, channels['layer1'], **kw)
-        layer2 = self.layer2.prep_finetune(iid, channels['layer1'], channels['layer2'],
-                             pool=pool, **kw)
-        layer3 = self.layer3.prep_finetune(iid, channels['layer2'], channels['layer3'],
-                             pool=pool, **kw)
-        res3 = self.res3.prep_finetune(iid, channels['layer3'], **kw)
-        layers = [prep, layer1, res1, layer2, layer3, res3]
-        parameters = [itertools.chain.from_iterable(layers), itertools.chain.from_iterable([m.parameters() for m in modules])]
-        return itertools.chain.from_iterable(parameters)
-        """
+
 
 class ResNet9(nn.Module):
-    def __init__(self, do_batchnorm=False, channels=None, weight=0.125, pool=nn.MaxPool2d(2),
-                 extra_layers=(), res_layers=('layer1', 'layer3'), **kw):
+    def __init__(
+        self, do_batchnorm=False, channels=None, weight=0.125, pool=nn.MaxPool2d(2),
+        extra_layers=(), res_layers=('layer1', 'layer3'), width=1.0, **kw
+    ):
         super().__init__()
-        self.channels = channels or {'prep': 64, 'layer1': 128,
-                                'layer2': 256, 'layer3': 512}
-        self.weight = weight
-        self.pool = pool
-        print(f"Using BatchNorm: {do_batchnorm}")
+        self.width = width
+        # scale standard channels by width multiplier
+        default_channels = channels or {'prep': 64, 'layer1': 128, 'layer2': 256, 'layer3': 512}
+        self.channels = {k: max(1, int(v * width)) for k, v in default_channels.items()}
+        # print(f"Using BatchNorm: {do_batchnorm}, Width Multiplier: {width}")
         self.n = BasicNet(do_batchnorm, self.channels, weight, pool, **kw)
         self.kw = kw
 
@@ -157,35 +145,74 @@ class ResNet9(nn.Module):
     def finetune_parameters(self):
         return self.n.finetune_parameters(self.iid, self.channels, self.weight, self.pool, **self.kw)
 
-class ResNet(nn.Module):
+
+class BottleNeck(nn.Module):
+    """Residual block for resnet over 50 layers with width scaling"""
+    expansion = 4
+
     def __init__(
-        self, block, num_block, base_width, num_classes=200, batch_norm=True,
+        self, in_channels, out_channels, stride=1, base_width=64, batch_norm=True, width=1.0
     ):
         super().__init__()
-
-        self.in_channels = 64
-
         self.batch_norm = batch_norm
+        # compute internal channel width
+        w = int(out_channels * (base_width / 64.0))
+        layer_list = [nn.Conv2d(in_channels, w, kernel_size=1, bias=False)]
+        if self.batch_norm:
+            layer_list.append(nn.BatchNorm2d(w))
+        layer_list += [nn.ReLU(inplace=True),
+                       nn.Conv2d(w, w, stride=stride, kernel_size=3, padding=1, bias=False)]
+        if self.batch_norm:
+            layer_list.append(nn.BatchNorm2d(w))
+        layer_list += [nn.ReLU(inplace=True),
+                       nn.Conv2d(w, out_channels * BottleNeck.expansion, kernel_size=1, bias=False)]
+        if self.batch_norm:
+            layer_list.append(nn.BatchNorm2d(out_channels * BottleNeck.expansion))
+        self.residual_function = nn.Sequential(*layer_list)
 
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels * BottleNeck.expansion:
+            sc_list = [nn.Conv2d(in_channels, out_channels * BottleNeck.expansion,
+                                  stride=stride, kernel_size=1, bias=False)]
+            if self.batch_norm:
+                sc_list.append(nn.BatchNorm2d(out_channels * BottleNeck.expansion))
+            self.shortcut = nn.Sequential(*sc_list)
+
+    def forward(self, x):
+        return nn.ReLU(inplace=True)(self.residual_function(x) + self.shortcut(x))
+
+
+class ResNet(nn.Module):
+    def __init__(
+        self, block, num_block, base_width=64, num_classes=200,
+        batch_norm=True, width=1.0
+    ):
+        super().__init__()
+        self.width = width
+        self.batch_norm = batch_norm
+        # initial conv1 channels scaled
+        self.in_channels = max(1, int(64 * width))
         if self.batch_norm:
             self.conv1 = nn.Sequential(
-                nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(64),
+                nn.Conv2d(3, self.in_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(self.in_channels),
                 nn.ReLU(inplace=True),
             )
         else:
             self.conv1 = nn.Sequential(
-                nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(3, self.in_channels, kernel_size=3, padding=1, bias=False),
                 nn.ReLU(inplace=True),
             )
-        # we use a different inputsize than the original paper
-        # so conv2_x's stride is 1
-        self.conv2_x = self._make_layer(block, 64, num_block[0], 1, base_width)
-        self.conv3_x = self._make_layer(block, 128, num_block[1], 2, base_width)
-        self.conv4_x = self._make_layer(block, 256, num_block[2], 2, base_width)
-        self.conv5_x = self._make_layer(block, 512, num_block[3], 2, base_width)
+        # scale base_width for Bottleneck internals
+        self.base_width = base_width * width
+        # scaled layer channels
+        self.conv2_x = self._make_layer(block, max(1, int(64 * width)), num_block[0], 1, self.base_width)
+        self.conv3_x = self._make_layer(block, max(1, int(128 * width)), num_block[1], 2, self.base_width)
+        self.conv4_x = self._make_layer(block, max(1, int(256 * width)), num_block[2], 2, self.base_width)
+        self.conv5_x = self._make_layer(block, max(1, int(512 * width)), num_block[3], 2, self.base_width)
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        # self.in_channels already set by last _make_layer
+        self.fc = nn.Linear(self.in_channels, num_classes)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -197,114 +224,38 @@ class ResNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def _make_layer(self, block, out_channels, num_blocks, stride, base_width):
-        """make resnet layers(by layer i didnt mean this 'layer' was the
-        same as a neuron netowork layer, ex. conv layer), one layer may
-        contain more than one residual block
-        Args:
-            block: block type, basic block or bottle neck block
-            out_channels: output depth channel number of this layer
-            num_blocks: how many blocks per layer
-            stride: the stride of the first block of this layer
-        Return:
-            return a resnet layer
-        """
-
-        # we have num_block blocks per layer, the first block
-        # could be 1 or 2, other blocks would always be 1
         strides = [stride] + [1] * (num_blocks - 1)
-        layer_list = []
-        for stride in strides:
-            layer_list.append(
-                block(
-                    self.in_channels, out_channels, stride, base_width, self.batch_norm
-                )
-            )
+        layers = []
+        for s in strides:
+            layers.append(block(self.in_channels, out_channels, s, base_width, self.batch_norm, width=self.width))
             self.in_channels = out_channels * block.expansion
-
-        return nn.Sequential(*layer_list)
-
-    def forward(self, x):
-        output = self.conv1(x)
-        output = self.conv2_x(output)
-        output = self.conv3_x(output)
-        output = self.conv4_x(output)
-        output = self.conv5_x(output)
-        output = self.avg_pool(output)
-        output = output.view(output.size(0), -1)
-        output = self.fc(output)
-
-        return output
-
-class BottleNeck(nn.Module):
-    """Residual block for resnet over 50 layers
-    """
-
-    expansion = 4
-
-    def __init__(
-        self, in_channels, out_channels, stride=1, base_width=64, batch_norm=True
-    ):
-        super().__init__()
-
-        self.batch_norm = batch_norm
-
-        width = int(out_channels * (base_width / 64.0))
-        layer_list = [
-            nn.Conv2d(in_channels, width, kernel_size=1, bias=False),
-        ]
-        if self.batch_norm:
-            layer_list.append(nn.BatchNorm2d(width))
-        layer_list += [
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                width, width, stride=stride, kernel_size=3, padding=1, bias=False
-            ),
-        ]
-        if self.batch_norm:
-            layer_list.append(nn.BatchNorm2d(width))
-        layer_list += [
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                width, out_channels * BottleNeck.expansion, kernel_size=1, bias=False
-            ),
-        ]
-        if self.batch_norm:
-            layer_list.append(nn.BatchNorm2d(out_channels * BottleNeck.expansion))
-        self.residual_function = nn.Sequential(*layer_list)
-
-        self.shortcut = nn.Sequential()
-
-        if stride != 1 or in_channels != out_channels * BottleNeck.expansion:
-            layer_list = [
-                nn.Conv2d(
-                    in_channels,
-                    out_channels * BottleNeck.expansion,
-                    stride=stride,
-                    kernel_size=1,
-                    bias=False,
-                ),
-            ]
-            if self.batch_norm:
-                layer_list.append(nn.BatchNorm2d(out_channels * BottleNeck.expansion))
-            self.shortcut = nn.Sequential(*layer_list)
+        return nn.Sequential(*layers)
 
     def forward(self, x):
-        return nn.ReLU(inplace=True)(self.residual_function(x) + self.shortcut(x))
+        x = self.conv1(x)
+        x = self.conv2_x(x)
+        x = self.conv3_x(x)
+        x = self.conv4_x(x)
+        x = self.conv5_x(x)
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
 
-def _resnet(arch, block, num_block, base_width, num_classes, pretrained, batch_norm, model_dir="pretrained_models"):
-    model = ResNet(block, num_block, base_width, num_classes, batch_norm)
+
+def _resnet(arch, block, num_block, base_width, num_classes, pretrained,
+            batch_norm, width=1.0, model_dir="pretrained_models"):
+    model = ResNet(block, num_block, base_width, num_classes, batch_norm, width)
     if pretrained:
-        pretrained_path = "{}/{}-cifar{}.pt".format(model_dir, arch, num_classes)
-        pretrained_dict = torch.load(pretrained_path)
-        pretrained_dict = pretrained_dict["model_state_dict"] # necessary because of our ckpt format
+        ckpt = torch.load(f"{model_dir}/{arch}-cifar{num_classes}.pt")
+        state = ckpt.get("model_state_dict", ckpt)
         model_dict = model.state_dict()
-        model_dict.update(pretrained_dict)
+        model_dict.update(state)
         model.load_state_dict(model_dict)
     return model
 
-def ResNet50(class_num=200, pretrained=False, model_dir="pretrained_models"):
-    """ return a ResNet 50 object
-    """
+
+def ResNet50(class_num=200, pretrained=False, width=1.0, model_dir="pretrained_models"):
     return _resnet(
         "resnet50",
         BottleNeck,
@@ -313,5 +264,6 @@ def ResNet50(class_num=200, pretrained=False, model_dir="pretrained_models"):
         class_num,
         pretrained,
         batch_norm=True,
+        width=width,
         model_dir=model_dir,
     )
