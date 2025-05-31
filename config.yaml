@@ -42,7 +42,7 @@ local_epochs: 1  # max local epochs to choose from
 # SNN settings
 widths: [0.25, 0.5, 0.75, 1.0]  # supported model widths
 use_adp_localiter: true  # dynamic local iteration
-local_iters: 100  # local iteration
+local_iters: 10  # local iteration
 clip_iter:  # max and min local iteration
   max: 100
   min: 1
